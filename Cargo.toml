@@ -1,0 +1,58 @@
+[package]
+name = "flashmoe"
+version = "0.1.0"
+edition = "2021"
+authors = ["jhammant"]
+description = "Dynamic MoE expert streaming for Apple Silicon"
+license = "MIT"
+repository = "https://github.com/jhammant/flashmoe"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "cargo"] }
+
+# Memory mapping
+memmap2 = "0.9"
+libc = "0.2"
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Progress bars
+indicatif = "0.17"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Random (for simulation)
+rand = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.13"
+
+[[bench]]
+name = "madvise_bench"
+harness = false
+
+[[bin]]
+name = "flashmoe"
+path = "src/main.rs"
+
+[[bin]]
+name = "simulate"
+path = "src/bin/simulate.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
