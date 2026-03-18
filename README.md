@@ -1,4 +1,4 @@
-# 🔥 HotSwapMLX
+# ⚡ FlashMoE
 
 **Dynamic MoE expert streaming for Apple Silicon — run 685B parameter models on a laptop.**
 
@@ -13,11 +13,11 @@ Mixture-of-Experts (MoE) models like DeepSeek V3 (685B) and Qwen3 235B are too l
 
 ## The Solution
 
-HotSwapMLX dynamically schedules expert computation across all three Apple Silicon compute units:
+FlashMoE dynamically schedules expert computation across all three Apple Silicon compute units:
 
 ```
 ┌─────────────────────────────────────────┐
-│               HotSwapMLX                │
+│               FlashMoE                │
 │                                         │
 │  GPU (Metal)     ANE (Orion)    CPU     │
 │  ┌───────────┐  ┌──────────┐  ┌─────┐  │
@@ -72,12 +72,12 @@ When RAM fills up, evict the coldest expert. Track per-expert activation pattern
 - **Orion** (arxiv 2603.06728) — First open ANE programming system. Proves ANE is viable for transformers.
 - **MLX Neural Accelerators** (Apple, 2026) — M5 GPU neural accelerators for matrix multiply.
 
-**HotSwapMLX is the first to combine dynamic expert scheduling + ANE compute + SSD streaming on Apple Silicon.**
+**FlashMoE is the first to combine dynamic expert scheduling + ANE compute + SSD streaming on Apple Silicon.**
 
 ## Architecture
 
 ```
-hotswapmlx/
+flashmoe/
 ├── core/
 │   ├── scheduler.py      # Dynamic expert scheduling engine
 │   ├── prefetcher.py     # Async SSD prefetch manager
@@ -104,16 +104,16 @@ hotswapmlx/
 ## Quick Start
 
 ```bash
-pip install hotswapmlx
+pip install flashmoe
 
 # Profile expert activation patterns on a model
-hotswapmlx profile --model deepseek-v3-q4 --samples 100
+flashmoe profile --model deepseek-v3-q4 --samples 100
 
 # Run inference with dynamic expert streaming
-hotswapmlx run --model deepseek-v3-q4 --ram-budget 100GB
+flashmoe run --model deepseek-v3-q4 --ram-budget 100GB
 
 # Benchmark against vanilla MLX/llama.cpp
-hotswapmlx bench --model deepseek-v3-q4 --compare mlx,llamacpp
+flashmoe bench --model deepseek-v3-q4 --compare mlx,llamacpp
 ```
 
 ## Requirements
