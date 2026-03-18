@@ -217,8 +217,8 @@ mod tests {
         assert_eq!(scheduler.get_state(0), ExpertState::Evicted);
     }
 
-    #[test]
-    fn test_scheduler_prediction() {
+    #[tokio::test]
+    async fn test_scheduler_prediction() {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(&vec![0u8; 1024 * 1024]).unwrap();
         file.flush().unwrap();
@@ -240,7 +240,7 @@ mod tests {
         scheduler.on_router_prediction(0, &[0, 1, 2]);
 
         // Give prefetch a moment
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let stats = scheduler.stats();
         assert!(stats.prefetching > 0 || stats.loaded > 0);

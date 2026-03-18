@@ -11,6 +11,9 @@ pub mod compute;
 pub mod model;
 pub mod profiler;
 
+#[cfg(feature = "llamacpp")]
+pub mod bridge;
+
 pub use core::{
     scheduler::ExpertScheduler,
     prefetcher::AsyncPrefetcher,

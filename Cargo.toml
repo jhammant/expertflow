@@ -36,13 +36,19 @@ anyhow = "1.0"
 # Random (for simulation)
 rand = "0.8"
 
+# Temporary files (for simulation)
+tempfile = "3.13"
+
+[features]
+default = []
+llamacpp = []
+
+[build-dependencies]
+cc = "1.0"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.13"
-
-[[bench]]
-name = "madvise_bench"
-harness = false
 
 [[bin]]
 name = "flashmoe"
