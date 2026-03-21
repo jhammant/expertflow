@@ -1,4 +1,4 @@
-//! Benchmarking suite for FlashMoE.
+//! Benchmarking suite for ExpertFlow.
 
 use std::time::{Duration, Instant};
 

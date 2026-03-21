@@ -1,4 +1,4 @@
-# ⚡ FlashMoE
+# ⚡ ExpertFlow
 
 **Dynamic MoE expert streaming for Apple Silicon — run 685B parameter models on a laptop.**
 
@@ -13,11 +13,11 @@ Mixture-of-Experts models like DeepSeek V3 (685B) and Qwen3 235B are too large f
 
 ## The Solution
 
-FlashMoE dynamically schedules expert computation across all Apple Silicon compute units:
+ExpertFlow dynamically schedules expert computation across all Apple Silicon compute units:
 
 ```
 ┌─────────────────────────────────────────┐
-│               FlashMoE                  │
+│               ExpertFlow                  │
 │                                         │
 │  GPU (Metal)     ANE (future)   CPU     │
 │  ┌───────────┐  ┌──────────┐  ┌─────┐  │
@@ -54,7 +54,7 @@ Direct `mmap` of GGUF/safetensors files. `madvise(MADV_WILLNEED)` for prefetch, 
 
 ## Performance Targets (M5 Max, 128GB)
 
-| Model | Params | Q4 Size | Vanilla mmap | FlashMoE |
+| Model | Params | Q4 Size | Vanilla mmap | ExpertFlow |
 |-------|--------|---------|--------------|----------|
 | Qwen3 235B (MoE) | 235B | ~110GB | 8-15 tok/s | 15-25 tok/s |
 | DeepSeek V3 (1-bit) | 685B | ~100GB | 5-10 tok/s | 10-18 tok/s |
@@ -63,11 +63,11 @@ Direct `mmap` of GGUF/safetensors files. `madvise(MADV_WILLNEED)` for prefetch, 
 
 ## Architecture
 
-FlashMoE wraps llama.cpp via FFI — we handle scheduling, llama.cpp handles compute.
+ExpertFlow wraps llama.cpp via FFI — we handle scheduling, llama.cpp handles compute.
 
 ```
 ┌──────────────────────────────────────┐
-│           FlashMoE (Rust)            │
+│           ExpertFlow (Rust)            │
 │                                      │
 │  src/                                │
 │  ├── main.rs              # CLI      │
@@ -101,23 +101,23 @@ FlashMoE wraps llama.cpp via FFI — we handle scheduling, llama.cpp handles com
 ## Quick Start
 
 ```bash
-cargo install flashmoe
+cargo install expertflow
 
 # Profile expert activation patterns
-flashmoe profile --model ./DeepSeek-V3-Q4.gguf --samples 100
+expertflow profile --model ./DeepSeek-V3-Q4.gguf --samples 100
 
 # Run inference with dynamic expert streaming  
-flashmoe run --model ./DeepSeek-V3-Q4.gguf --ram-budget 100
+expertflow run --model ./DeepSeek-V3-Q4.gguf --ram-budget 100
 
 # Benchmark against vanilla mmap baseline
-flashmoe bench --model ./DeepSeek-V3-Q4.gguf
+expertflow bench --model ./DeepSeek-V3-Q4.gguf
 ```
 
 ## Building
 
 ```bash
-git clone https://github.com/jhammant/flashmoe
-cd flashmoe
+git clone https://github.com/jhammant/expertflow
+cd expertflow
 cargo build --release
 ```
 
@@ -130,16 +130,16 @@ cargo build --release
 
 ## M5 GPU Architecture Insights
 
-FlashMoE is designed around the specific hardware characteristics of Apple's M5 chips, informed by [Apple's MLX research](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) and independent benchmarks.
+ExpertFlow is designed around the specific hardware characteristics of Apple's M5 chips, informed by [Apple's MLX research](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) and independent benchmarks.
 
 ### Why M5 Changes Everything for MoE
 
 The M5 introduces **Neural Accelerators** — dedicated matrix-multiplication units embedded in every GPU core (40 on M5 Max). This creates a two-speed inference regime:
 
-| Phase | Bottleneck | M5 vs M4 | FlashMoE Strategy |
+| Phase | Bottleneck | M5 vs M4 | ExpertFlow Strategy |
 |-------|-----------|----------|-------------------|
-| Prompt processing (TTFT) | **Compute** | **3.3–4× faster** | Neural Accelerators handle this natively — no FlashMoE intervention needed |
-| Token generation | **Memory bandwidth** | ~15–27% faster | **This is where FlashMoE shines** — smart prefetch/eviction keeps hot experts in unified memory |
+| Prompt processing (TTFT) | **Compute** | **3.3–4× faster** | Neural Accelerators handle this natively — no ExpertFlow intervention needed |
+| Token generation | **Memory bandwidth** | ~15–27% faster | **This is where ExpertFlow shines** — smart prefetch/eviction keeps hot experts in unified memory |
 
 ### Key Hardware Numbers (M5 Max 128GB)
 
@@ -151,11 +151,11 @@ The M5 introduces **Neural Accelerators** — dedicated matrix-multiplication un
 
 ### Design Implications
 
-1. **MLX over llama.cpp** — Apple's [MLX framework](https://mlx-framework.org) is 20–50% faster than Ollama/llama.cpp on Apple Silicon. FlashMoE should target MLX as the primary compute backend via Metal 4 TensorOps.
+1. **MLX over llama.cpp** — Apple's [MLX framework](https://mlx-framework.org) is 20–50% faster than Ollama/llama.cpp on Apple Silicon. ExpertFlow should target MLX as the primary compute backend via Metal 4 TensorOps.
 
 2. **Focus on token generation** — TTFT is already 3-4× faster with Neural Accelerators. The real win is in sustained generation, where bandwidth is the bottleneck and smart expert caching provides the most uplift.
 
-3. **MoE sweet spot** — Qwen3-30B (3B active params, 4-bit quantized) uses only 17GB and gets TTFT under 3 seconds on M5. With 128GB, FlashMoE can keep *all* experts for multiple MoE layers resident simultaneously.
+3. **MoE sweet spot** — Qwen3-30B (3B active params, 4-bit quantized) uses only 17GB and gets TTFT under 3 seconds on M5. With 128GB, ExpertFlow can keep *all* experts for multiple MoE layers resident simultaneously.
 
 4. **Heterogeneous dispatch opportunity** — GPU Neural Accelerators handle dense matmuls (attention, embeddings). The separate 16-core Neural Engine could potentially run expert FFN/MLP in parallel. This is Phase 5 (research).
 
@@ -175,25 +175,25 @@ The M5 introduces **Neural Accelerators** — dedicated matrix-multiplication un
 
 ## The Speculative Stack Vision
 
-FlashMoE is designed to be one layer of a three-phase inference pipeline for interactive MoE on Apple Silicon:
+ExpertFlow is designed to be one layer of a three-phase inference pipeline for interactive MoE on Apple Silicon:
 
 ```
 ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│  SpecPrefill     │───▶│  FlashMoE        │───▶│  MTP Decode      │
+│  SpecPrefill     │───▶│  ExpertFlow        │───▶│  MTP Decode      │
 │  Sparse prefill  │    │  Expert stream   │    │  Multi-token     │
 │  3-5× TTFT ↓     │    │  2-3× gen ↑      │    │  30-60% tok/s ↑  │
 └──────────────────┘    └──────────────────┘    └──────────────────┘
 ```
 
 - **[SpecPrefill](https://doi.org/10.5281/zenodo.19120919)** (Green 2026) — Uses a 2B draft model to score prompt token importance via attention, sparse-prefills only 20% into the target. 3.7–5.5× TTFT reduction on Qwen3.5-122B (M2 Ultra). Built on vllm-mlx.
-- **FlashMoE** — Dynamic expert caching during generation. Hot experts stay resident, cold experts stream from NVMe.
+- **ExpertFlow** — Dynamic expert caching during generation. Hot experts stay resident, cold experts stream from NVMe.
 - **MTP** — Multi-Token Prediction speculative decoding for throughput.
 
-The draft model used by SpecPrefill generates MoE router activations as a free side-effect — FlashMoE can use these to predict which experts the target model will need 1-2 layers ahead. See [docs/SPECPREFILL-INTEGRATION.md](docs/SPECPREFILL-INTEGRATION.md).
+The draft model used by SpecPrefill generates MoE router activations as a free side-effect — ExpertFlow can use these to predict which experts the target model will need 1-2 layers ahead. See [docs/SPECPREFILL-INTEGRATION.md](docs/SPECPREFILL-INTEGRATION.md).
 
 ## Prior Art
 
-- **[SpecPrefill](https://doi.org/10.5281/zenodo.19120919)** — Attention-based sparse prefill. 3.7–5.5× TTFT on M2 Ultra. Complementary to FlashMoE (handles prefill, not generation).
+- **[SpecPrefill](https://doi.org/10.5281/zenodo.19120919)** — Attention-based sparse prefill. 3.7–5.5× TTFT on M2 Ultra. Complementary to ExpertFlow (handles prefill, not generation).
 - **[HOBBIT](https://arxiv.org/abs/2411.01433)** — Mixed precision expert offloading, 9.93× speedup. NVIDIA only.
 - **[Krasis](https://github.com/brontoguana/krasis)** — Hybrid GPU/CPU streaming. NVIDIA + Linux only.
 - **[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)** — CPU-side MoE offloading. Basic, no smart scheduling.
@@ -202,7 +202,7 @@ The draft model used by SpecPrefill generates MoE router activations as a free s
 - **[jangq.ai](https://jangq.ai)** — Custom 2-3 bit MLX quantisations that beat 4-bit on MMLU.
 - **[mlx.studio](https://mlx.studio)** — Paged KV cache + hybrid model support for MLX.
 
-**FlashMoE is the first to combine dynamic expert scheduling + SSD streaming + draft-model-as-oracle on Apple Silicon.**
+**ExpertFlow is the first to combine dynamic expert scheduling + SSD streaming + draft-model-as-oracle on Apple Silicon.**
 
 ## Roadmap
 

@@ -1,8 +1,8 @@
-//! # FlashMoE
+//! # ExpertFlow
 //!
 //! Dynamic MoE expert streaming for Apple Silicon.
 //!
-//! FlashMoE orchestrates expert computation across GPU, ANE, and CPU,
+//! ExpertFlow orchestrates expert computation across GPU, ANE, and CPU,
 //! streaming cold experts from NVMe on demand while keeping hot experts
 //! pinned in unified memory.
 

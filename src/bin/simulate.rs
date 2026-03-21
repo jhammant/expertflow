@@ -1,11 +1,11 @@
-//! Simulation binary for FlashMoE without llama.cpp dependency.
+//! Simulation binary for ExpertFlow without llama.cpp dependency.
 //!
 //! This creates a fake model file and simulates MoE inference to demonstrate
 //! the scheduling algorithm in isolation. Useful for testing and benchmarking
 //! the scheduler without needing actual model weights.
 
 use clap::Parser;
-use flashmoe::core::{
+use expertflow::core::{
     evictor::TemperatureEvictor,
     memory::{ExpertRegion, MemoryManager},
     prefetcher::AsyncPrefetcher,
@@ -22,8 +22,8 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
-#[command(name = "flashmoe-simulate")]
-#[command(about = "Simulate FlashMoE scheduling without llama.cpp", long_about = None)]
+#[command(name = "expertflow-simulate")]
+#[command(about = "Simulate ExpertFlow scheduling without llama.cpp", long_about = None)]
 struct Args {
     /// Number of MoE layers
     #[arg(long, default_value = "28")]
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    println!("🚀 FlashMoE Simulation");
+    println!("🚀 ExpertFlow Simulation");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Configuration:");
     println!("  Layers: {}", args.layers);
@@ -203,15 +203,15 @@ fn run_simulation(scheduler: &ExpertScheduler, args: &Args) -> anyhow::Result<Si
                 let state = scheduler.get_state(expert_id);
 
                 match state {
-                    flashmoe::core::scheduler::ExpertState::Loaded => {
+                    expertflow::core::scheduler::ExpertState::Loaded => {
                         stats.cache_hits += 1;
                     }
-                    flashmoe::core::scheduler::ExpertState::Prefetching => {
+                    expertflow::core::scheduler::ExpertState::Prefetching => {
                         stats.prefetch_hits += 1;
                         // Simulate blocking wait for prefetch
                         std::thread::sleep(Duration::from_micros(100));
                     }
-                    flashmoe::core::scheduler::ExpertState::Evicted => {
+                    expertflow::core::scheduler::ExpertState::Evicted => {
                         stats.cache_misses += 1;
                         // Simulate blocking load from SSD
                         std::thread::sleep(Duration::from_millis(1));

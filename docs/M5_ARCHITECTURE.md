@@ -1,4 +1,4 @@
-# M5 Architecture Notes for FlashMoE
+# M5 Architecture Notes for ExpertFlow
 
 ## Sources
 - [Apple ML Research: Exploring LLMs with MLX and M5 Neural Accelerators](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)
@@ -9,7 +9,7 @@
 
 ### 1. Target MLX, Not llama.cpp
 
-MLX is 20-50% faster than Ollama on Apple Silicon. FlashMoE Phase 7 should replace the
+MLX is 20-50% faster than Ollama on Apple Silicon. ExpertFlow Phase 7 should replace the
 llama.cpp FFI bridge with an MLX Python/Swift bridge:
 
 - MLX uses Metal 4 TensorOps natively → Neural Accelerators "just work"
@@ -20,10 +20,10 @@ llama.cpp FFI bridge with an MLX Python/Swift bridge:
 ### 2. Two-Phase Inference Strategy
 
 **Prompt processing (TTFT):** Compute-bound → Neural Accelerators give 3-4× speedup for free.
-FlashMoE does NOT need to optimise this phase. Let MLX/Metal handle it.
+ExpertFlow does NOT need to optimise this phase. Let MLX/Metal handle it.
 
 **Token generation:** Bandwidth-bound → 614 GB/s on M5 Max.
-THIS is where FlashMoE adds value:
+THIS is where ExpertFlow adds value:
 - Expert prefetching hides SSD latency (7.4 GB/s NVMe)
 - Temperature tracking keeps hot experts pinned in unified memory  
 - Eviction of cold experts frees bandwidth for active computation
@@ -37,14 +37,14 @@ Model: DeepSeek V3 685B (1-bit quant) ≈ 100GB on disk
   - With 128GB: ALL experts fit in RAM → no SSD streaming needed!
   
 Model: Qwen3-235B MoE (4-bit quant) ≈ 110GB on disk  
-  - Exceeds RAM by ~20GB → FlashMoE manages overflow
+  - Exceeds RAM by ~20GB → ExpertFlow manages overflow
   - Active experts: ~12GB per layer (3B active params)
   - At any given time: ~30GB hot, ~80GB warm/cold
   - SSD streaming budget: 7.4 GB/s → can load a cold expert (~500MB) in ~68ms
 
 Model: Future 1T+ MoE models
   - Will exceed 128GB significantly
-  - FlashMoE's full scheduling pipeline essential
+  - ExpertFlow's full scheduling pipeline essential
 ```
 
 ### 4. MoE Expert Sizes

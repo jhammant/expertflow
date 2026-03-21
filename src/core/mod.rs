@@ -1,4 +1,4 @@
-//! Core FlashMoE components: scheduler, memory, prefetcher, evictor.
+//! Core ExpertFlow components: scheduler, memory, prefetcher, evictor.
 
 pub mod scheduler;
 pub mod memory;

@@ -1,11 +1,11 @@
 [package]
-name = "flashmoe"
+name = "expertflow"
 version = "0.1.0"
 edition = "2021"
 authors = ["jhammant"]
 description = "Dynamic MoE expert streaming for Apple Silicon"
 license = "MIT"
-repository = "https://github.com/jhammant/flashmoe"
+repository = "https://github.com/jhammant/expertflow"
 
 [dependencies]
 # CLI
@@ -51,7 +51,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.13"
 
 [[bin]]
-name = "flashmoe"
+name = "expertflow"
 path = "src/main.rs"
 
 [[bin]]

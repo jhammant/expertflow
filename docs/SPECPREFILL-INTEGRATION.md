@@ -1,17 +1,17 @@
-# SpecPrefill + FlashMoE: The Complete Apple Silicon MoE Stack
+# SpecPrefill + ExpertFlow: The Complete Apple Silicon MoE Stack
 
 ## Overview
 
-SpecPrefill (Green, March 2026) and FlashMoE address **different bottlenecks** in MoE inference on Apple Silicon:
+SpecPrefill (Green, March 2026) and ExpertFlow address **different bottlenecks** in MoE inference on Apple Silicon:
 
 | Phase | Bottleneck | Solution | Speedup |
 |-------|-----------|----------|---------|
 | **Prefill (TTFT)** | Compute-bound (FLOPs) | SpecPrefill — sparse prefill via draft attention scoring | 3.7–5.5× |
-| **Generation (tok/s)** | Memory bandwidth-bound | FlashMoE — smart expert caching + SSD streaming | 2–3× (projected) |
+| **Generation (tok/s)** | Memory bandwidth-bound | ExpertFlow — smart expert caching + SSD streaming | 2–3× (projected) |
 
 Combined, these could make 122B+ MoE models genuinely interactive on M5 Max:
 - **128K prompt, Qwen3.5-122B:** 19.3 min → 3.5 min (SpecPrefill) 
-- **Token generation:** +50-100% throughput (FlashMoE expert prefetch)
+- **Token generation:** +50-100% throughput (ExpertFlow expert prefetch)
 
 ## How SpecPrefill Works
 
@@ -75,12 +75,12 @@ Where `k` = keep fraction (0.2), `C_draft` ≪ `C_target`. When FLOP ratio is ~5
 1. **Multi-turn KV cache invalidation** — Sparse KV cache from SpecPrefill can't be persisted across turns (different token selection each time). Draft KV cache is cacheable though.
 2. **System prompt preservation** — Solved: system prompt gets full prefill with snapshotted KV state. SpecPrefill only applies after the system boundary.
 
-## Integration with FlashMoE
+## Integration with ExpertFlow
 
 ### The "Speculative Stack" (3-phase inference)
 
 ```
-Phase 1: SpecPrefill (TTFT)           Phase 2: FlashMoE (Generation)     Phase 3: MTP (Throughput)
+Phase 1: SpecPrefill (TTFT)           Phase 2: ExpertFlow (Generation)     Phase 3: MTP (Throughput)
 ┌─────────────────────┐               ┌────────────────────────┐          ┌──────────────────┐
 │ Draft model scores  │               │ Expert temp tracking   │          │ Multi-token       │
 │ prompt importance   │──────────────▶│ Lookahead prefetch     │─────────▶│ prediction       │
@@ -91,16 +91,16 @@ Phase 1: SpecPrefill (TTFT)           Phase 2: FlashMoE (Generation)     Phase 3
 
 ### Shared Infrastructure
 
-Both SpecPrefill and FlashMoE benefit from:
-- **Draft model as router oracle** — The same 2B draft model used for SpecPrefill scoring could inform FlashMoE's expert prefetch predictions (the draft's MoE router activations reveal which experts the target will need)
+Both SpecPrefill and ExpertFlow benefit from:
+- **Draft model as router oracle** — The same 2B draft model used for SpecPrefill scoring could inform ExpertFlow's expert prefetch predictions (the draft's MoE router activations reveal which experts the target will need)
 - **MLX unified memory** — Zero-copy for both draft scoring and expert caching
-- **Temperature tracking** — FlashMoE's expert temperature could inform SpecPrefill's token selection (hot experts = hot tokens)
+- **Temperature tracking** — ExpertFlow's expert temperature could inform SpecPrefill's token selection (hot experts = hot tokens)
 
 ### Implementation Plan
 
-1. **Phase 7 (MLX backend)** — Port FlashMoE from llama.cpp FFI to MLX. This is a prerequisite for SpecPrefill integration since SpecPrefill is built on vllm-mlx.
+1. **Phase 7 (MLX backend)** — Port ExpertFlow from llama.cpp FFI to MLX. This is a prerequisite for SpecPrefill integration since SpecPrefill is built on vllm-mlx.
 
-2. **Phase 8 (SpecPrefill integration)** — Add `specprefill.py` as a prefill preprocessor in FlashMoE's inference pipeline. Draft model loading/caching handled by FlashMoE's memory manager.
+2. **Phase 8 (SpecPrefill integration)** — Add `specprefill.py` as a prefill preprocessor in ExpertFlow's inference pipeline. Draft model loading/caching handled by ExpertFlow's memory manager.
 
 3. **Phase 9 (Draft-as-oracle)** — Use draft model's MoE router activations to predict target model expert needs 1-2 layers ahead. This is the novel contribution: **SpecPrefill's draft run generates expert routing predictions as a free side-effect**.
 

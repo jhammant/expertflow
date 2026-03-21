@@ -20,11 +20,11 @@ and ModelFit.io benchmarks (March 2026).
 - **Token Generation:** 19–27% faster (bandwidth-bound → modest improvement)
 - **Image gen (FLUX):** 3.8x faster
 
-## What This Means for FlashMoE
+## What This Means for ExpertFlow
 
 ### 1. Expert FFN Compute → Neural Accelerators
 The expert FFN/MLP layers are large matrix multiplications — exactly what Neural Accelerators
-are designed for. FlashMoE should dispatch expert compute through Metal 4 TensorOps instead
+are designed for. ExpertFlow should dispatch expert compute through Metal 4 TensorOps instead
 of generic Metal compute shaders.
 
 **Action:** Add a `NeuralAccelerator` compute backend that uses Metal Performance Primitives
@@ -55,7 +55,7 @@ With 614 GB/s bandwidth and 128GB unified memory:
 | Qwen3 235B MoE | ~110GB | ~70% hot | ~30% on NVMe | 15-25 t/s |
 | DeepSeek V3 1-bit | ~100GB | ~80% hot | ~20% on NVMe | 10-18 t/s |
 
-For models that fit entirely in 128GB, FlashMoE's value is in:
+For models that fit entirely in 128GB, ExpertFlow's value is in:
 - **Dynamic pinning** — keep frequently-used experts page-locked
 - **Prefetch for context switches** — when routing pattern changes
 - **Multi-model hot-swap** — hold 2-3 models simultaneously
@@ -73,7 +73,7 @@ Add bandwidth-aware prefetch scheduling — avoid saturating the SSD bus.
 Apple's benchmarks show MoE models are the sweet spot:
 - Qwen3-30B (3B active params, 4-bit): TTFT under 3 seconds, 17GB memory
 - Only 3B parameters active per token → bandwidth-efficient
-- FlashMoE adds value by keeping the RIGHT experts hot based on conversation context
+- ExpertFlow adds value by keeping the RIGHT experts hot based on conversation context
 
 **Action:** Optimise the temperature tracker for MoE routing patterns.
 Track per-conversation expert affinity (e.g., "coding" conversations use different

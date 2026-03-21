@@ -1,10 +1,10 @@
-//! FlashMoE CLI - Dynamic MoE expert streaming for Apple Silicon
+//! ExpertFlow CLI - Dynamic MoE expert streaming for Apple Silicon
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "flashmoe")]
+#[command(name = "expertflow")]
 #[command(about = "Dynamic MoE expert streaming for Apple Silicon", long_about = None)]
 #[command(version)]
 struct Cli {
@@ -58,7 +58,7 @@ enum Commands {
         output: PathBuf,
     },
 
-    /// Benchmark FlashMoE vs vanilla mmap
+    /// Benchmark ExpertFlow vs vanilla mmap
     #[cfg(feature = "llamacpp")]
     Bench {
         /// Path to the GGUF model file
@@ -103,7 +103,7 @@ fn main() -> anyhow::Result<()> {
             n_ctx,
             prompt,
         } => {
-            println!("🚀 FlashMoE - Running inference");
+            println!("🚀 ExpertFlow - Running inference");
             println!("Model: {:?}", model);
             println!("RAM budget: {} GB", ram_budget);
             println!("Threads: {}", threads);
@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
             samples,
             output,
         } => {
-            println!("📊 FlashMoE - Profiling expert activation patterns");
+            println!("📊 ExpertFlow - Profiling expert activation patterns");
             println!("Model: {:?}", model);
             println!("Samples: {}", samples);
             println!("Output: {:?}", output);
@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "llamacpp")]
         Commands::Bench { model, tokens } => {
-            println!("⚡ FlashMoE - Benchmarking");
+            println!("⚡ ExpertFlow - Benchmarking");
             println!("Model: {:?}", model);
             println!("Tokens: {}", tokens);
 
@@ -153,7 +153,7 @@ fn main() -> anyhow::Result<()> {
             active,
             steps,
         } => {
-            println!("🎮 FlashMoE - Simulation mode");
+            println!("🎮 ExpertFlow - Simulation mode");
             println!();
             println!("For simulation, please use the dedicated binary:");
             println!();
