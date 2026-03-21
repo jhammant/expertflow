@@ -128,26 +128,73 @@ cargo build --release
 - Rust 1.75+ 
 - Xcode Command Line Tools (for Metal SDK)
 
+## M5 GPU Architecture Insights
+
+FlashMoE is designed around the specific hardware characteristics of Apple's M5 chips, informed by [Apple's MLX research](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) and independent benchmarks.
+
+### Why M5 Changes Everything for MoE
+
+The M5 introduces **Neural Accelerators** — dedicated matrix-multiplication units embedded in every GPU core (40 on M5 Max). This creates a two-speed inference regime:
+
+| Phase | Bottleneck | M5 vs M4 | FlashMoE Strategy |
+|-------|-----------|----------|-------------------|
+| Prompt processing (TTFT) | **Compute** | **3.3–4× faster** | Neural Accelerators handle this natively — no FlashMoE intervention needed |
+| Token generation | **Memory bandwidth** | ~15–27% faster | **This is where FlashMoE shines** — smart prefetch/eviction keeps hot experts in unified memory |
+
+### Key Hardware Numbers (M5 Max 128GB)
+
+- **Memory bandwidth:** 614 GB/s (vs 546 GB/s M4 Max)
+- **NVMe read:** ~7.4 GB/s (sequential)
+- **Unified memory:** 128GB — fits 70B Q4 (~40GB) with 88GB to spare
+- **GPU cores:** 40, each with a Neural Accelerator
+- **Neural Engine:** 16-core, 38 TOPS (separate from GPU Neural Accelerators)
+
+### Design Implications
+
+1. **MLX over llama.cpp** — Apple's [MLX framework](https://mlx-framework.org) is 20–50% faster than Ollama/llama.cpp on Apple Silicon. FlashMoE should target MLX as the primary compute backend via Metal 4 TensorOps.
+
+2. **Focus on token generation** — TTFT is already 3-4× faster with Neural Accelerators. The real win is in sustained generation, where bandwidth is the bottleneck and smart expert caching provides the most uplift.
+
+3. **MoE sweet spot** — Qwen3-30B (3B active params, 4-bit quantized) uses only 17GB and gets TTFT under 3 seconds on M5. With 128GB, FlashMoE can keep *all* experts for multiple MoE layers resident simultaneously.
+
+4. **Heterogeneous dispatch opportunity** — GPU Neural Accelerators handle dense matmuls (attention, embeddings). The separate 16-core Neural Engine could potentially run expert FFN/MLP in parallel. This is Phase 5 (research).
+
+5. **macOS 26.2 required** — Neural Accelerator support needs the latest macOS beta for Metal 4 TensorOps.
+
+### MLX Performance Reference (MacBook Pro M5, 24GB)
+
+| Model | TTFT Speedup vs M4 | Gen Speedup | Memory |
+|-------|-------------------|-------------|--------|
+| Qwen3-1.7B BF16 | 3.57× | 1.27× | 4.4 GB |
+| Qwen3-8B BF16 | 3.62× | 1.24× | 17.5 GB |
+| Qwen3-14B 4-bit | 4.06× | 1.19× | 9.2 GB |
+| Qwen3-30B MoE 4-bit | 3.52× | 1.25× | 17.3 GB |
+| GPT-OSS-20B MXFP4 | 3.33× | 1.24× | 12.1 GB |
+
+*Source: [Apple ML Research, March 2026](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)*
+
 ## Prior Art
 
 - **[HOBBIT](https://arxiv.org/abs/2411.01433)** — Mixed precision expert offloading, 9.93× speedup. NVIDIA only.
 - **[Krasis](https://github.com/brontoguana/krasis)** — Hybrid GPU/CPU streaming. NVIDIA + Linux only.
 - **[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)** — CPU-side MoE offloading. Basic, no smart scheduling.
 - **[Orion](https://arxiv.org/abs/2603.06728)** — First open ANE programming system for transformers.
-- **[MLX](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)** — Apple's ML framework with M5 Neural Accelerators.
+- **[MLX](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)** — Apple's ML framework with M5 Neural Accelerators + Metal 4 TensorOps.
 
-**FlashMoE is the first to combine dynamic expert scheduling + SSD streaming on Apple Silicon.**
+**FlashMoE is the first to combine dynamic expert scheduling + SSD streaming + MLX integration on Apple Silicon.**
 
 ## Roadmap
 
 - [x] Architecture design
-- [ ] Phase 1: mmap + madvise expert pinning/prefetch
+- [x] Scheduler, prefetcher, evictor, simulator (2,384 lines Rust)
+- [ ] Phase 1: mmap + madvise expert pinning/prefetch on real GGUF
 - [ ] Phase 2: Dynamic scheduler with router lookahead  
 - [ ] Phase 3: Temperature-based eviction
-- [ ] Phase 4: Metal compute integration
-- [ ] Phase 5: ANE dispatch (research)
+- [ ] Phase 4: Metal 4 compute integration (TensorOps + Neural Accelerators)
+- [ ] Phase 5: ANE dispatch (research — requires macOS 26.2)
 - [ ] Phase 6: GGUF expert extraction
-- [ ] Benchmarks on M5 Max (March 23)
+- [ ] Phase 7: MLX backend (replace llama.cpp FFI)
+- [ ] Benchmarks on M5 Max 128GB
 
 ## License
 
