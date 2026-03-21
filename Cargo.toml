@@ -42,6 +42,8 @@ tempfile = "3.13"
 [features]
 default = []
 llamacpp = []
+mlx = []
+metal4 = []
 
 [build-dependencies]
 cc = "1.0"

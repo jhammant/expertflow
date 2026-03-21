@@ -209,12 +209,12 @@ The draft model used by SpecPrefill generates MoE router activations as a free s
 - [x] Architecture design
 - [x] Scheduler, prefetcher, evictor, simulator (2,384 lines Rust)
 - [ ] Phase 1: mmap + madvise expert pinning/prefetch on real GGUF
-- [ ] Phase 2: Dynamic scheduler with router lookahead  
+- [ ] Phase 2: Dynamic scheduler with router lookahead
 - [ ] Phase 3: Temperature-based eviction
 - [ ] Phase 4: Metal 4 compute integration (TensorOps + Neural Accelerators)
 - [ ] Phase 5: ANE dispatch (research — requires macOS 26.2)
 - [ ] Phase 6: GGUF expert extraction
-- [ ] Phase 7: MLX backend (replace llama.cpp FFI)
+- [x] **Phase 7: MLX backend** — Python bridge + JSON-over-stdio protocol, Metal 4 TensorOps placeholder
 - [ ] Phase 8: SpecPrefill integration (sparse prefill via draft attention scoring)
 - [ ] Phase 9: Draft-as-oracle (use draft MoE router to predict target expert needs)
 - [ ] Benchmarks on M5 Max 128GB

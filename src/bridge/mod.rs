@@ -17,3 +17,10 @@ pub use expert_hook::ExpertLoadHook;
 
 #[cfg(feature = "llamacpp")]
 pub use router_hook::RouterPredictionHook;
+
+// MLX backend (Apple Silicon native)
+#[cfg(feature = "mlx")]
+pub mod mlx;
+
+#[cfg(feature = "mlx")]
+pub use mlx::{MlxModel, MlxContext};
