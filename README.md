@@ -173,15 +173,36 @@ The M5 introduces **Neural Accelerators** — dedicated matrix-multiplication un
 
 *Source: [Apple ML Research, March 2026](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)*
 
+## The Speculative Stack Vision
+
+FlashMoE is designed to be one layer of a three-phase inference pipeline for interactive MoE on Apple Silicon:
+
+```
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  SpecPrefill     │───▶│  FlashMoE        │───▶│  MTP Decode      │
+│  Sparse prefill  │    │  Expert stream   │    │  Multi-token     │
+│  3-5× TTFT ↓     │    │  2-3× gen ↑      │    │  30-60% tok/s ↑  │
+└──────────────────┘    └──────────────────┘    └──────────────────┘
+```
+
+- **[SpecPrefill](https://doi.org/10.5281/zenodo.19120919)** (Green 2026) — Uses a 2B draft model to score prompt token importance via attention, sparse-prefills only 20% into the target. 3.7–5.5× TTFT reduction on Qwen3.5-122B (M2 Ultra). Built on vllm-mlx.
+- **FlashMoE** — Dynamic expert caching during generation. Hot experts stay resident, cold experts stream from NVMe.
+- **MTP** — Multi-Token Prediction speculative decoding for throughput.
+
+The draft model used by SpecPrefill generates MoE router activations as a free side-effect — FlashMoE can use these to predict which experts the target model will need 1-2 layers ahead. See [docs/SPECPREFILL-INTEGRATION.md](docs/SPECPREFILL-INTEGRATION.md).
+
 ## Prior Art
 
+- **[SpecPrefill](https://doi.org/10.5281/zenodo.19120919)** — Attention-based sparse prefill. 3.7–5.5× TTFT on M2 Ultra. Complementary to FlashMoE (handles prefill, not generation).
 - **[HOBBIT](https://arxiv.org/abs/2411.01433)** — Mixed precision expert offloading, 9.93× speedup. NVIDIA only.
 - **[Krasis](https://github.com/brontoguana/krasis)** — Hybrid GPU/CPU streaming. NVIDIA + Linux only.
 - **[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)** — CPU-side MoE offloading. Basic, no smart scheduling.
 - **[Orion](https://arxiv.org/abs/2603.06728)** — First open ANE programming system for transformers.
 - **[MLX](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)** — Apple's ML framework with M5 Neural Accelerators + Metal 4 TensorOps.
+- **[jangq.ai](https://jangq.ai)** — Custom 2-3 bit MLX quantisations that beat 4-bit on MMLU.
+- **[mlx.studio](https://mlx.studio)** — Paged KV cache + hybrid model support for MLX.
 
-**FlashMoE is the first to combine dynamic expert scheduling + SSD streaming + MLX integration on Apple Silicon.**
+**FlashMoE is the first to combine dynamic expert scheduling + SSD streaming + draft-model-as-oracle on Apple Silicon.**
 
 ## Roadmap
 
@@ -194,6 +215,8 @@ The M5 introduces **Neural Accelerators** — dedicated matrix-multiplication un
 - [ ] Phase 5: ANE dispatch (research — requires macOS 26.2)
 - [ ] Phase 6: GGUF expert extraction
 - [ ] Phase 7: MLX backend (replace llama.cpp FFI)
+- [ ] Phase 8: SpecPrefill integration (sparse prefill via draft attention scoring)
+- [ ] Phase 9: Draft-as-oracle (use draft MoE router to predict target expert needs)
 - [ ] Benchmarks on M5 Max 128GB
 
 ## License
