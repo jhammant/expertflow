@@ -44,6 +44,7 @@ default = []
 llamacpp = []
 mlx = []
 metal4 = []
+vmlx = []
 
 [build-dependencies]
 cc = "1.0"

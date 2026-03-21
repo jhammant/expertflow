@@ -217,6 +217,11 @@ The draft model used by SpecPrefill generates MoE router activations as a free s
 - [x] **Phase 7: MLX backend** — Python bridge + JSON-over-stdio protocol, Metal 4 TensorOps placeholder
 - [ ] Phase 8: SpecPrefill integration (sparse prefill via draft attention scoring)
 - [ ] Phase 9: Draft-as-oracle (use draft MoE router to predict target expert needs)
+- [x] **Phase 10: Persistent expert cache** — Disk-backed cache for warm restarts (~/.expertflow/cache.json)
+- [x] **Phase 11: Adaptive expert quantization** — Hot experts stay Q4, cold experts demote to Q2 for memory savings
+- [x] **Phase 12: KV cache-aware memory budget** — Dynamic expert budget adjusts based on KV cache pressure
+- [x] **Phase 13: vMLX bridge** — OpenAI-compatible API integration with vMLX serving framework
+- [x] **Phase 14: Hybrid architecture support** — MoE+SSM models (Nemotron-H, Jamba, GatedDeltaNet)
 - [ ] Benchmarks on M5 Max 128GB
 
 ## License

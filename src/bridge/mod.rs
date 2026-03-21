@@ -24,3 +24,10 @@ pub mod mlx;
 
 #[cfg(feature = "mlx")]
 pub use mlx::{MlxModel, MlxContext};
+
+// vMLX backend (OpenAI-compatible API)
+#[cfg(feature = "vmlx")]
+pub mod vmlx;
+
+#[cfg(feature = "vmlx")]
+pub use vmlx::{VmlxBridge, Bridge};

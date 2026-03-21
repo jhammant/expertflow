@@ -4,10 +4,12 @@
 //! predictions and memory pressure.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::cache::disk::{CacheEntry, DiskCache};
 use crate::core::evictor::TemperatureEvictor;
 use crate::core::memory::{MemoryManager, MemoryError};
 use crate::core::prefetcher::AsyncPrefetcher;
@@ -30,6 +32,7 @@ pub struct ExpertScheduler {
     prefetcher: AsyncPrefetcher,
     evictor: TemperatureEvictor,
     states: Arc<Mutex<HashMap<ExpertId, ExpertState>>>,
+    cache: Option<Arc<Mutex<DiskCache>>>,
     ram_budget: usize,
     prefetch_lookahead: usize,
 }
@@ -42,14 +45,69 @@ impl ExpertScheduler {
     /// - `ram_budget`: Maximum RAM to use for experts (bytes)
     /// - `prefetch_lookahead`: Number of layers to prefetch ahead
     pub fn new(memory: Arc<MemoryManager>, ram_budget: usize, prefetch_lookahead: usize) -> Self {
+        Self::with_cache(memory, ram_budget, prefetch_lookahead, None)
+    }
+
+    /// Create a new expert scheduler with optional disk cache
+    ///
+    /// # Parameters
+    /// - `memory`: Memory manager
+    /// - `ram_budget`: Maximum RAM to use for experts (bytes)
+    /// - `prefetch_lookahead`: Number of layers to prefetch ahead
+    /// - `cache_path`: Optional path to cache file (uses default if None)
+    pub fn with_cache<P: AsRef<Path>>(
+        memory: Arc<MemoryManager>,
+        ram_budget: usize,
+        prefetch_lookahead: usize,
+        cache_path: Option<P>,
+    ) -> Self {
         let prefetcher = AsyncPrefetcher::new(Arc::clone(&memory));
         let evictor = TemperatureEvictor::with_defaults(Arc::clone(&memory));
+
+        // Load or create disk cache
+        let cache = match cache_path {
+            Some(path) => match DiskCache::with_path(path) {
+                Ok(cache) => {
+                    info!("Loaded disk cache with {} entries", cache.len());
+                    Some(Arc::new(Mutex::new(cache)))
+                }
+                Err(e) => {
+                    warn!("Failed to load cache from custom path: {}", e);
+                    None
+                }
+            },
+            None => match DiskCache::new() {
+                Ok(cache) => {
+                    info!("Loaded default disk cache with {} entries", cache.len());
+                    Some(Arc::new(Mutex::new(cache)))
+                }
+                Err(e) => {
+                    debug!("No disk cache available: {}", e);
+                    None
+                }
+            },
+        };
+
+        // Pre-warm hot experts from cache
+        if let Some(ref cache) = cache {
+            let hot_experts = cache.lock().unwrap().get_hot_experts(10);
+            info!("Pre-warming {} hot experts from cache", hot_experts.len());
+            for entry in hot_experts {
+                debug!(
+                    "Pre-warming expert {} (temp={:.2}, count={})",
+                    entry.expert_id, entry.temperature, entry.access_count
+                );
+                // Trigger async prefetch
+                let _ = memory.pin_expert(entry.expert_id);
+            }
+        }
 
         Self {
             memory,
             prefetcher,
             evictor,
             states: Arc::new(Mutex::new(HashMap::new())),
+            cache,
             ram_budget,
             prefetch_lookahead,
         }
@@ -175,6 +233,50 @@ impl ExpertScheduler {
     /// Run temperature decay (should be called periodically)
     pub fn tick(&self) {
         self.evictor.decay_all();
+    }
+
+    /// Save current expert state to disk cache
+    pub fn save_cache(&self) -> Result<(), String> {
+        if let Some(ref cache) = self.cache {
+            let evictor_stats = self.evictor.stats();
+            let states = self.states.lock().unwrap();
+
+            let mut cache_guard = cache.lock().unwrap();
+            cache_guard.clear();
+
+            // Save all loaded experts with their temperatures
+            for &expert_id in states.keys() {
+                if let Some(temperature) = self.evictor.get_temperature(expert_id) {
+                    cache_guard.update_entry(CacheEntry {
+                        expert_id,
+                        temperature,
+                        access_count: 0, // Could track this separately if needed
+                        last_session_time: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    });
+                }
+            }
+
+            cache_guard
+                .save()
+                .map_err(|e| format!("Failed to save cache: {}", e))?;
+
+            info!("Saved {} expert entries to cache", cache_guard.len());
+            Ok(())
+        } else {
+            debug!("No cache configured, skipping save");
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ExpertScheduler {
+    fn drop(&mut self) {
+        if let Err(e) = self.save_cache() {
+            warn!("Failed to auto-save cache on drop: {}", e);
+        }
     }
 }
 

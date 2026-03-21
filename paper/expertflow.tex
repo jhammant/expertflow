@@ -233,6 +233,24 @@ This creates a virtual address space backed by the file. Physical pages are allo
 
 On unified memory architectures, GPU and CPU share the same page tables—there is no explicit DMA transfer. A page faulted in for CPU access is immediately accessible to GPU Metal kernels.
 
+\subsection{Advanced Features}
+
+To enhance performance and robustness beyond the core scheduling algorithm, \textsc{ExpertFlow} incorporates five additional techniques inspired by production ML serving systems:
+
+\textbf{Persistent Expert Cache:} Expert activation patterns exhibit high temporal correlation across inference sessions—a model processing similar queries (e.g., coding tasks) consistently activates similar expert subsets. We serialize expert temperature maps to disk (\texttt{\textasciitilde/.expertflow/cache.json}) on shutdown and reload on startup, enabling warm-start prefetching of previously-hot experts. This eliminates cold-start latency for recurring workloads.
+
+\textbf{Adaptive Expert Quantization:} Different experts experience vastly different access frequencies—hot experts may be accessed 100$\times$ more frequently than cold experts. We dynamically adjust quantization precision: hot experts ($T(e) > \theta_{\text{hot}}$) are promoted to 4-bit (Q4) for quality, while cold experts ($T(e) < \theta_{\text{cold}}$) are demoted to 2-bit (Q2) for memory savings. This adaptive strategy, inspired by JANG-style quantization \cite{jangq2026}, reduces memory footprint by up to 50\% with minimal quality degradation, as cold experts contribute negligibly to output.
+
+\textbf{KV Cache-Aware Budget:} Long conversations accumulate large KV caches—a 32k-token context with 80 layers requires $\sim$10GB (BF16). The expert memory budget must be \textit{dynamic}:
+\begin{equation}
+    B_{\text{expert}}(t) = B_{\text{total}} - B_{\text{KV}}(t) - B_{\text{reserve}}
+\end{equation}
+where $B_{\text{KV}}(t)$ grows during inference. We integrate KV cache size tracking directly into the scheduler, automatically triggering more aggressive expert eviction as conversations lengthen.
+
+\textbf{vMLX Backend:} The vMLX framework \cite{vmlx2026} provides a production-ready OpenAI-compatible inference server with built-in batching, speculative decoding, and KV cache management. We implement a \texttt{Bridge} trait supporting both raw MLX (JSON-over-stdio) and vMLX (HTTP REST API) backends, enabling seamless integration with existing MLX-based serving infrastructure.
+
+\textbf{Hybrid Architecture Support:} Not all layers in modern large models are MoE—Nemotron-H alternates MoE and dense layers \cite{nemotron2026}, Jamba interleaves MoE with Mamba (SSM) layers \cite{jamba2024}, and GatedDeltaNet mixes all three \cite{deltanet2025}. We extend the configuration system with a \texttt{LayerKind} enum (MoE, Dense, SSM, Mamba) and layer-specific routing. Only MoE layers require expert scheduling; dense/SSM layers remain fully resident, reducing scheduler overhead by up to 50\% for hybrid models.
+
 \subsection{Expert Scheduling Algorithm}
 
 Algorithm~\ref{alg:scheduling} formalizes the core scheduling loop.

@@ -1,6 +1,7 @@
-//! Core ExpertFlow components: scheduler, memory, prefetcher, evictor.
+//! Core ExpertFlow components: scheduler, memory, prefetcher, evictor, budget.
 
-pub mod scheduler;
+pub mod budget;
+pub mod evictor;
 pub mod memory;
 pub mod prefetcher;
-pub mod evictor;
+pub mod scheduler;
