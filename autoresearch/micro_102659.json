@@ -1,0 +1,18 @@
+{
+  "test": "microbench",
+  "layers_tested": 5,
+  "layer_times": [
+    1.22,
+    0.52,
+    0.51,
+    0.52,
+    0.51
+  ],
+  "errors": [],
+  "timestamp": "102659",
+  "load_time": 0.7,
+  "completed_layers": 5,
+  "avg_layer_time": 0.66,
+  "total_time": 3.3,
+  "free_gb": 103.7
+}

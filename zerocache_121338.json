@@ -1,0 +1,13 @@
+{
+  "prompt": "Hello",
+  "output": "ign\u00e9 cide",
+  "full_text": "Helloign\u00e9 cide",
+  "tokens": 3,
+  "avg_tok_s": 0.0082,
+  "times": [
+    69.87,
+    138.13,
+    159.83
+  ],
+  "total_s": 367.8
+}

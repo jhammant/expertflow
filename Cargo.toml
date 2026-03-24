@@ -39,6 +39,10 @@ rand = "0.8"
 # Temporary files (for simulation)
 tempfile = "3.13"
 
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
 [features]
 default = []
 llamacpp = []
@@ -60,6 +64,10 @@ path = "src/main.rs"
 [[bin]]
 name = "simulate"
 path = "src/bin/simulate.rs"
+
+[[bin]]
+name = "expertflow-tui"
+path = "src/bin/tui.rs"
 
 [profile.release]
 opt-level = 3

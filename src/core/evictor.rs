@@ -100,7 +100,7 @@ impl TemperatureEvictor {
         let mut states = self.states.lock().unwrap();
         let now = Instant::now();
 
-        for (id, state) in states.iter_mut() {
+        for (_id, state) in states.iter_mut() {
             let dt = now.duration_since(state.last_access);
             state.decay(self.decay_rate, dt);
         }

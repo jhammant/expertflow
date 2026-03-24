@@ -59,7 +59,7 @@ impl MemoryBudget {
     /// Called by the inference engine when allocating KV cache memory
     pub fn reserve_kv(&self, bytes: usize) {
         let mut inner = self.inner.lock().unwrap();
-        let old_size = inner.kv_cache_size;
+        let _old_size = inner.kv_cache_size;
         inner.kv_cache_size += bytes;
 
         debug!(
@@ -162,7 +162,7 @@ impl MemoryBudget {
     /// Get statistics about memory budget
     pub fn stats(&self) -> MemoryBudgetStats {
         let inner = self.inner.lock().unwrap();
-        let expert_budget = drop(inner); // Release lock
+        drop(inner); // Release lock
         let expert_budget = self.expert_budget();
 
         let inner = self.inner.lock().unwrap();

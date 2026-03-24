@@ -33,7 +33,7 @@ impl RouterLookahead {
     /// 1. Run the router forward pass on the current hidden state
     /// 2. Use top-k selection to get the most likely experts
     /// 3. Optionally look ahead 1-2 tokens to predict future activations
-    pub fn lookahead(&self, layer: LayerIdx, _hidden_state: Option<&[f32]>) -> Vec<ExpertId> {
+    pub fn lookahead(&self, _layer: LayerIdx, _hidden_state: Option<&[f32]>) -> Vec<ExpertId> {
         let mut rng = rand::thread_rng();
 
         // Mock implementation: weighted random selection

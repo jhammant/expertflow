@@ -2,3 +2,6 @@ target/
 *.rlib
 *.so
 *.d
+logs/
+__pycache__/
+*.pyc

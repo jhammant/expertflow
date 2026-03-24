@@ -9,7 +9,7 @@ use std::fs::File;
 use std::path::Path;
 use thiserror::Error;
 
-use crate::{ExpertId, LayerIdx};
+use crate::ExpertId;
 
 #[cfg(target_os = "macos")]
 const MADV_WILLNEED: libc::c_int = 3;

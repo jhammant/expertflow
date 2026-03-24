@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::Path;
 use thiserror::Error;
 

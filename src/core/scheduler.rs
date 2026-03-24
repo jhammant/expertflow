@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::cache::disk::{CacheEntry, DiskCache};
@@ -45,7 +44,7 @@ impl ExpertScheduler {
     /// - `ram_budget`: Maximum RAM to use for experts (bytes)
     /// - `prefetch_lookahead`: Number of layers to prefetch ahead
     pub fn new(memory: Arc<MemoryManager>, ram_budget: usize, prefetch_lookahead: usize) -> Self {
-        Self::with_cache(memory, ram_budget, prefetch_lookahead, None)
+        Self::with_cache::<std::path::PathBuf>(memory, ram_budget, prefetch_lookahead, None)
     }
 
     /// Create a new expert scheduler with optional disk cache
@@ -238,7 +237,7 @@ impl ExpertScheduler {
     /// Save current expert state to disk cache
     pub fn save_cache(&self) -> Result<(), String> {
         if let Some(ref cache) = self.cache {
-            let evictor_stats = self.evictor.stats();
+            let _evictor_stats = self.evictor.stats();
             let states = self.states.lock().unwrap();
 
             let mut cache_guard = cache.lock().unwrap();

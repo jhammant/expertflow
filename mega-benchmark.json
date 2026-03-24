@@ -1,0 +1,227 @@
+[
+  {
+    "model": "DeepSeek V3.1",
+    "total_params": "671B",
+    "active_params": "37B",
+    "analysis": {
+      "total_gb": 377.6,
+      "expert_gb": 369.3,
+      "backbone_gb": 8.3,
+      "expert_pct": 97.8,
+      "expert_tensors": 1044,
+      "backbone_tensors": 1309,
+      "expert_groups": 14848,
+      "avg_expert_mb": 24.87,
+      "unique_experts": 256,
+      "fits_in_ram": false,
+      "caching": {
+        "LRU-50": {
+          "cache_size": 50,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 2307.9,
+          "io_time_s": 116.72,
+          "ms_per_step": 583.6,
+          "active_memory_gb": 1.2,
+          "steps": 200
+        },
+        "LRU-100": {
+          "cache_size": 100,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 2307.9,
+          "io_time_s": 116.72,
+          "ms_per_step": 583.6,
+          "active_memory_gb": 2.5,
+          "steps": 200
+        },
+        "LRU-200": {
+          "cache_size": 200,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 2307.9,
+          "io_time_s": 116.72,
+          "ms_per_step": 583.6,
+          "active_memory_gb": 5.0,
+          "steps": 200
+        },
+        "LRU-500": {
+          "cache_size": 500,
+          "hit_rate": 3.1,
+          "miss_rate": 96.9,
+          "io_gb": 2235.9,
+          "io_time_s": 113.08,
+          "ms_per_step": 565.4,
+          "active_memory_gb": 12.4,
+          "steps": 200
+        }
+      }
+    },
+    "nvme_bandwidth_gbs": 19.8,
+    "single_expert_load": {
+      "tensor_key": "model.layers.3.mlp.switch_mlp.gate_proj.biases",
+      "size_mb": 117.44,
+      "load_time_ms": 8.9,
+      "bandwidth_gbs": 13.19
+    },
+    "full_load": {
+      "status": "IMPOSSIBLE",
+      "would_need_gb": 377.6
+    },
+    "expertflow": {
+      "backbone_gb": 8.3,
+      "total_with_cache_gb": 13.3,
+      "memory_savings_pct": 96.5
+    }
+  },
+  {
+    "model": "MiniMax-M2",
+    "total_params": "230B",
+    "active_params": "10B",
+    "analysis": {
+      "total_gb": 128.7,
+      "expert_gb": 126.4,
+      "backbone_gb": 2.2,
+      "expert_pct": 98.3,
+      "expert_tensors": 806,
+      "backbone_tensors": 999,
+      "expert_groups": 7936,
+      "avg_expert_mb": 15.93,
+      "unique_experts": 128,
+      "fits_in_ram": false,
+      "caching": {
+        "LRU-50": {
+          "cache_size": 50,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 1427.5,
+          "io_time_s": 98.23,
+          "ms_per_step": 491.1,
+          "active_memory_gb": 0.8,
+          "steps": 200
+        },
+        "LRU-100": {
+          "cache_size": 100,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 1427.5,
+          "io_time_s": 98.23,
+          "ms_per_step": 491.1,
+          "active_memory_gb": 1.6,
+          "steps": 200
+        },
+        "LRU-200": {
+          "cache_size": 200,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 1427.5,
+          "io_time_s": 98.23,
+          "ms_per_step": 491.1,
+          "active_memory_gb": 3.2,
+          "steps": 200
+        },
+        "LRU-500": {
+          "cache_size": 500,
+          "hit_rate": 6.3,
+          "miss_rate": 93.7,
+          "io_gb": 1337.2,
+          "io_time_s": 92.02,
+          "ms_per_step": 460.1,
+          "active_memory_gb": 8.0,
+          "steps": 200
+        }
+      }
+    },
+    "nvme_bandwidth_gbs": 14.5,
+    "single_expert_load": {
+      "tensor_key": "model.layers.0.block_sparse_moe.e_score_correction_bias",
+      "size_mb": 0.0,
+      "load_time_ms": 3.6,
+      "bandwidth_gbs": 0.0
+    },
+    "full_load": {
+      "status": "IMPOSSIBLE",
+      "would_need_gb": 128.7
+    },
+    "expertflow": {
+      "backbone_gb": 2.2,
+      "total_with_cache_gb": 5.4,
+      "memory_savings_pct": 95.8
+    }
+  },
+  {
+    "model": "GLM-4.5 Full",
+    "total_params": "355B",
+    "active_params": "32B",
+    "analysis": {
+      "total_gb": 198.6,
+      "expert_gb": 190.2,
+      "backbone_gb": 8.4,
+      "expert_pct": 95.8,
+      "expert_tensors": 1602,
+      "backbone_tensors": 1960,
+      "expert_groups": 22784,
+      "avg_expert_mb": 8.35,
+      "unique_experts": 256,
+      "fits_in_ram": false,
+      "caching": {
+        "LRU-50": {
+          "cache_size": 50,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 827.9,
+          "io_time_s": 56.42,
+          "ms_per_step": 282.1,
+          "active_memory_gb": 0.4,
+          "steps": 200
+        },
+        "LRU-100": {
+          "cache_size": 100,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 827.9,
+          "io_time_s": 56.42,
+          "ms_per_step": 282.1,
+          "active_memory_gb": 0.8,
+          "steps": 200
+        },
+        "LRU-200": {
+          "cache_size": 200,
+          "hit_rate": 0.0,
+          "miss_rate": 100.0,
+          "io_gb": 827.9,
+          "io_time_s": 56.42,
+          "ms_per_step": 282.1,
+          "active_memory_gb": 1.7,
+          "steps": 200
+        },
+        "LRU-500": {
+          "cache_size": 500,
+          "hit_rate": 2.8,
+          "miss_rate": 97.2,
+          "io_gb": 805.1,
+          "io_time_s": 54.86,
+          "ms_per_step": 274.3,
+          "active_memory_gb": 4.2,
+          "steps": 200
+        }
+      }
+    },
+    "nvme_bandwidth_gbs": 14.7,
+    "single_expert_load": {
+      "tensor_key": "model.layers.3.mlp.shared_experts.down_proj.biases",
+      "size_mb": 0.25,
+      "load_time_ms": 0.5,
+      "bandwidth_gbs": 0.52
+    },
+    "full_load": {
+      "status": "IMPOSSIBLE",
+      "would_need_gb": 198.6
+    },
+    "expertflow": {
+      "backbone_gb": 8.4,
+      "total_with_cache_gb": 10.1,
+      "memory_savings_pct": 94.9
+    }
+  }
+]

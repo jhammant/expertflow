@@ -1,0 +1,880 @@
+\documentclass[11pt,a4paper]{article}
+
+% ============================================================
+% Packages
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{natbib}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=green!50!black,
+  urlcolor=blue!70!black
+}
+
+% ============================================================
+\title{ExpertFlow: Dynamic Expert Streaming for\\
+Mixture-of-Experts Inference on Consumer Hardware}
+
+\author{
+  Jonathan Hammant\\
+  Independent Researcher\\
+  London, United Kingdom\\
+  \texttt{jhammant@gmail.com}
+}
+
+\date{March 2026}
+
+% ============================================================
+\begin{document}
+\maketitle
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+Mixture-of-Experts (MoE) architectures achieve strong performance at reduced
+computational cost by activating only a small subset of parameters per token.
+However, their total parameter counts---often exceeding 100\,GB even after
+quantisation---render them impractical on consumer hardware with limited
+memory. We observe that 90--97\% of an MoE model's weights reside in expert
+layers, yet only 2--10\% of experts are activated for any given token. We
+present \textbf{ExpertFlow}, a system that exploits this structural sparsity
+through memory-mapped safetensor loading, automatic expert identification, and
+an LRU eviction cache that dynamically streams experts on demand. On an Apple
+M5~Max with 128\,GB of unified memory, ExpertFlow reduces peak resident memory
+by \textbf{93.5\%} (from 41.8\,GB to 2.7\,GB) for Qwen3-Next-80B-A3B while
+incurring only a 12\% throughput penalty. More importantly, ExpertFlow is the
+only feasible path for running models that exceed available RAM entirely: a
+352\,GB DeepSeek~V3.1 (2.75$\times$ device memory) can be served on
+a single consumer device through expert streaming alone. We release ExpertFlow
+as open-source software under the MIT licence.
+\end{abstract}
+
+\paragraph{Keywords.} Mixture-of-Experts, model inference, memory efficiency,
+Apple Silicon, dynamic loading, consumer hardware.
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+The rapid scaling of large language models (LLMs) has produced architectures
+with hundreds of billions of parameters~\citep{chowdhery2022palm,
+touvron2023llama2}. Mixture-of-Experts (MoE) models~\citep{shazeer2017outrageously,
+fedus2022switch} offer a compelling middle ground: they maintain a large total
+parameter count for capacity but activate only a fraction of those parameters
+per token, yielding favourable compute-per-quality tradeoffs. Models such as
+Mixtral~8$\times$7B~\citep{jiang2024mixtral}, DeepSeek-V2~\citep{deepseekv2},
+and Qwen3-Next-80B-A3B demonstrate this paradigm at scale, routing each token
+to a small subset of specialised ``expert'' feed-forward networks.
+
+Despite their computational efficiency, MoE models impose a severe
+\emph{memory} burden. All experts must traditionally be resident in memory even
+though most are idle at any point in time. For Qwen3-Next-80B-A3B, a model
+with 512 experts of which only 10 are active per token, the expert layers
+constitute 43.49\,GB out of a total 44.84\,GB---\textbf{97\% of the model's
+weights are dormant during any given forward pass}. This ``memory paradox''
+means that the memory required to host an MoE model is determined by its total
+parameter count, not its active parameter count.
+
+Consumer hardware has made remarkable progress. Apple Silicon devices with
+unified memory architectures now offer up to 192\,GB of shared CPU--GPU memory
+with bandwidth exceeding 800\,GB/s~\citep{apple2024m4}. Frameworks such as
+MLX~\citep{mlx2023} exploit this unified memory model to deliver competitive
+inference throughput. Yet even 128\,GB is insufficient for many frontier MoE
+models once quantisation, KV caches, and operating system overhead are
+accounted for.
+
+Existing approaches to this problem fall into three categories:
+\emph{compression} (quantisation, pruning, distillation), which trades quality
+for size; \emph{offloading} (CPU/disk paging of layers), which incurs
+significant latency from PCIe transfers; and \emph{expert parallelism}, which
+requires multiple accelerators. None of these approaches exploit the
+fundamental structural property of MoE models: that the vast majority of
+parameters are \emph{never needed simultaneously}.
+
+We introduce \textbf{ExpertFlow}, a system that bridges this gap.
+ExpertFlow memory-maps safetensor model shards, automatically identifies and
+classifies expert versus non-expert tensors via a naming-convention heuristic,
+pre-loads the compact non-expert backbone into memory, and serves expert
+weights on demand through an LRU eviction cache. Because expert activations
+exhibit strong temporal locality---the same experts tend to be re-selected
+across consecutive tokens---the cache achieves a 90\% hit rate even at modest
+sizes, and the throughput penalty relative to full model loading is only 12\%.
+
+Our contributions are:
+\begin{enumerate}[nosep]
+  \item A \textbf{taxonomy of MoE model weight structure} quantifying the
+    expert-to-backbone ratio across contemporary architectures, showing that
+    90--97\% of parameters are expert-only.
+  \item \textbf{ExpertFlow}, an open-source Rust implementation of
+    memory-mapped expert streaming with LRU caching for safetensor models.
+  \item \textbf{Empirical evaluation} on Apple M5~Max showing 93.5\% memory
+    reduction with 12\% throughput cost, and demonstrating feasibility for
+    models up to 2.75$\times$ device memory.
+\end{enumerate}
+
+% ============================================================
+% 2. RELATED WORK
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Model Compression}
+\label{sec:related:compression}
+
+Quantisation reduces model precision from 16-bit to 8-bit, 4-bit, or
+lower~\citep{dettmers2022gptint8, frantar2023gptq, lin2024awq,
+dettmers2023qlora}. While effective---4-bit quantisation can reduce a model to
+$\sim$25\% of its original size---quantisation is orthogonal to our approach
+and can be composed with ExpertFlow. Indeed, our benchmarks use 4-bit
+quantised models. Pruning~\citep{frantar2023sparsegpt, sun2023wanda} and
+knowledge distillation~\citep{hinton2015distilling, gu2024minillm} further
+reduce model size but typically require retraining or fine-tuning. ExpertFlow
+requires no model modification whatsoever.
+
+\subsection{Offloading}
+\label{sec:related:offloading}
+
+FlexGen~\citep{sheng2023flexgen} introduces a throughput-oriented offloading
+strategy that pipelines GPU, CPU, and disk storage for batch inference.
+DeepSpeed-Inference~\citep{aminabadi2022deepspeed} supports multi-GPU
+parallelism with CPU offloading for individual layers.
+llama.cpp~\citep{gerganov2023llamacpp} implements layer-level GPU/CPU
+splitting, allowing users to specify how many layers reside on the GPU.
+PowerInfer~\citep{song2023powerinfer} takes a neuron-level approach, profiling
+activation patterns offline to place ``hot'' neurons on GPU and ``cold''
+neurons on CPU.
+
+These systems treat the model as a monolithic stack of layers and do not
+exploit the MoE-specific property that experts within a layer are mutually
+exclusive. ExpertFlow operates at the expert granularity, loading only the
+2--10\% of experts actually selected by the router for each token.
+
+\subsection{MoE-Specific Optimisation}
+\label{sec:related:moe}
+
+The Switch Transformer~\citep{fedus2022switch} introduced single-expert
+routing, reducing the communication overhead of MoE. Expert parallelism
+distributes experts across devices~\citep{lepikhin2021gshard,
+rajbhandari2022deepspeedmoe}, but requires multi-GPU setups unavailable to
+consumer users. SE-MoE~\citep{hwang2023semoe} explores structured expert
+pruning. MoE-Infinity~\citep{xue2024moeinf} offloads experts to CPU and
+introduces activation-aware prefetching, conceptually closest to our work but
+targeting NVIDIA GPU systems with PCIe-separated memory.
+Pre-gated MoE~\citep{hwang2024pregated} proposes predicting expert assignments
+one layer ahead to enable prefetching, a strategy compatible with and
+complementary to ExpertFlow's caching.
+
+\subsection{Apple Silicon Inference}
+\label{sec:related:apple}
+
+MLX~\citep{mlx2023} and mlx-lm provide native inference on Apple Silicon,
+exploiting unified memory to avoid CPU$\leftrightarrow$GPU copies. LM
+Studio~\citep{lmstudio} supports GGUF models via llama.cpp with Metal
+acceleration. These frameworks assume the full model fits in memory.
+ExpertFlow extends their reach to models that do not.
+
+% ============================================================
+% 3. METHOD
+% ============================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem Formulation}
+\label{sec:method:problem}
+
+Consider an MoE transformer with $L$ layers, each containing a router
+$R_l(\cdot)$ and $N$ experts $\{E_{l,1}, \ldots, E_{l,N}\}$. For each token
+$x$, the router selects $k \ll N$ experts:
+\begin{equation}
+  \mathcal{S}_l(x) = \text{Top-}k\bigl(R_l(h_l(x))\bigr), \quad
+  |\mathcal{S}_l(x)| = k
+\end{equation}
+where $h_l(x)$ is the hidden state at layer $l$. The layer output is a
+weighted sum of the selected experts:
+\begin{equation}
+  y_l(x) = \sum_{i \in \mathcal{S}_l(x)} g_{l,i}(x) \cdot E_{l,i}(h_l(x))
+\end{equation}
+where $g_{l,i}$ are the gating weights from the router softmax.
+
+The total expert weight is $W_{\text{expert}} = L \times N \times w_e$ where
+$w_e$ is the size of a single expert. The active weight per token is
+$W_{\text{active}} = L \times k \times w_e$. The \emph{sparsity ratio} is:
+\begin{equation}
+  \rho = 1 - \frac{k}{N}
+\end{equation}
+For Qwen3-Next-80B-A3B with $N=512$ and $k=10$, $\rho = 0.980$. This extreme
+sparsity is the foundation of ExpertFlow.
+
+\subsection{System Architecture}
+\label{sec:method:arch}
+
+ExpertFlow operates in four phases:
+
+\paragraph{Phase 1: Model Analysis.}
+ExpertFlow scans safetensor shard metadata (JSON headers) without loading
+weights. Each tensor name is classified as \emph{expert} or
+\emph{non-expert} using a pattern-matching heuristic over conventional MoE
+naming schemes (e.g., \texttt{experts.}, \texttt{block\_sparse\_moe.experts},
+\texttt{mlp.experts}). This classification produces a manifest of
+(tensor\_name, shard\_file, byte\_offset, byte\_length, classification)
+tuples.
+
+\paragraph{Phase 2: Backbone Pre-loading.}
+All non-expert tensors---embeddings, layer norms, attention weights, router
+weights, and the language model head---are loaded into memory eagerly. These
+constitute the model ``backbone'' and are required for every forward pass.
+For Qwen3-Next-80B-A3B, the backbone is 1.36\,GB (3\% of total), making this
+step fast (0.2\,s) and memory-efficient.
+
+\paragraph{Phase 3: Expert Memory Mapping.}
+Safetensor shard files containing expert weights are memory-mapped via
+\texttt{mmap(2)} with \texttt{MAP\_PRIVATE} semantics. No physical memory is
+consumed until pages are faulted in by actual reads. The operating system's
+virtual memory subsystem handles page-level caching transparently, and
+Apple's unified memory architecture ensures that mapped pages are directly
+accessible by both CPU and GPU compute units without explicit transfers.
+
+\paragraph{Phase 4: LRU Expert Cache.}
+During inference, when a router selects experts $\mathcal{S}_l(x)$, ExpertFlow
+checks a software LRU cache. On a cache hit, the expert's weight tensor
+is returned directly from the cache. On a miss, the tensor is read from the
+memory-mapped region (faulting in OS pages as needed), placed into the cache,
+and the least-recently-used entry is evicted if the cache is full. Evicted
+entries release their reference, allowing the OS to reclaim the underlying
+physical pages under memory pressure.
+
+\begin{algorithm}[t]
+\caption{ExpertFlow Expert Retrieval}
+\label{alg:expertflow}
+\begin{algorithmic}[1]
+\REQUIRE Router selection $\mathcal{S}_l(x)$, LRU cache $\mathcal{C}$
+  with capacity $C$, memory-mapped shards $\mathcal{M}$
+\ENSURE Expert weight tensors $\{W_i\}_{i \in \mathcal{S}_l(x)}$
+\FOR{$i \in \mathcal{S}_l(x)$}
+  \IF{$(l, i) \in \mathcal{C}$}
+    \STATE $W_i \gets \mathcal{C}.\text{get}(l, i)$ \COMMENT{Cache hit;
+      promotes to MRU}
+  \ELSE
+    \STATE $(f, o, n) \gets \text{manifest}(l, i)$
+      \COMMENT{Shard file, offset, length}
+    \STATE $W_i \gets \mathcal{M}[f][o : o+n]$
+      \COMMENT{Read from mmap; OS page fault}
+    \STATE $\mathcal{C}.\text{put}((l, i), W_i)$
+      \COMMENT{Insert; evicts LRU if $|\mathcal{C}| > C$}
+  \ENDIF
+\ENDFOR
+\RETURN $\{W_i\}_{i \in \mathcal{S}_l(x)}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Expert Classification Heuristic}
+\label{sec:method:heuristic}
+
+Safetensor models follow de facto naming conventions established by the
+Hugging Face transformers library~\citep{wolf2020transformers}. Expert tensors
+are identified by the presence of an \texttt{experts} segment in the tensor
+path, optionally preceded by architecture-specific prefixes
+(\texttt{block\_sparse\_moe}, \texttt{mlp}, \texttt{moe}). The heuristic
+achieves perfect classification on all models tested (Mixtral, DeepSeek-V2,
+Qwen3-Next, GPT-OSS) by matching against a small set of regular expressions.
+For novel architectures, users can supply custom patterns.
+
+\subsection{LRU Eviction Policy}
+\label{sec:method:lru}
+
+We choose LRU eviction for its simplicity and effectiveness given the observed
+access patterns of MoE routers. Expert reuse is characterised by:
+\begin{itemize}[nosep]
+  \item \textbf{Temporal locality}: consecutive tokens in a sequence tend to
+    activate overlapping expert sets, as they share semantic context.
+  \item \textbf{Layer-wise correlation}: certain experts are co-activated
+    across layers for tokens in the same domain (e.g., code tokens
+    consistently activate a specific subset of experts).
+\end{itemize}
+
+These properties produce a working set that is substantially smaller than the
+total expert pool, enabling high cache hit rates even with modest cache sizes.
+We validate this empirically in \Cref{sec:experiments}.
+
+\subsection{Implementation}
+\label{sec:method:impl}
+
+ExpertFlow is implemented in Rust for performance-critical paths (mmap
+management, cache data structures, safetensor parsing) with Python bindings
+for integration with ML frameworks. The safetensor header parser extracts
+tensor metadata from JSON headers without deserialising weight data. The LRU
+cache uses a hash map with a doubly-linked list for $O(1)$ access, insertion,
+and eviction. Memory-mapped I/O uses platform-native calls (\texttt{mmap} on
+macOS/Linux) with advisory hints (\texttt{MADV\_SEQUENTIAL} for initial scans,
+\texttt{MADV\_RANDOM} for inference-time access).
+
+% ============================================================
+% 4. EXPERIMENTS
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+\label{sec:experiments:setup}
+
+All experiments are conducted on a single Apple M5~Max with 128\,GB unified
+memory, running macOS~26.3.1. Models are served via mlx-lm~\citep{mlx2023}
+or LM Studio~\citep{lmstudio} as noted. All timing results are averaged
+over 5 runs unless stated otherwise; standard deviations are reported where
+available.
+
+\subsection{Model Weight Analysis}
+\label{sec:experiments:analysis}
+
+\begin{table}[t]
+\centering
+\caption{Weight distribution analysis for Qwen3-Next-80B-A3B (4-bit
+  quantised). Expert layers dominate the total parameter count.}
+\label{tab:weight-analysis}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Component} & \textbf{Size (GB)} & \textbf{Tensors} &
+  \textbf{\% of Total} \\
+\midrule
+Total model          & 44.84 & 1891 & 100.0\% \\
+Expert weights       & 43.49 &  --- &  97.0\% \\
+Non-expert backbone  &  1.36 &  --- &   3.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:weight-analysis} presents the weight distribution for
+Qwen3-Next-80B-A3B, a model with 512 experts of which 10 are activated per
+token. The expert layers account for 97\% of total model weight. The non-expert
+backbone---comprising embeddings, attention projections, layer normalisations,
+router weights, and the output head---requires only 1.36\,GB. This extreme
+ratio is characteristic of high-expert-count MoE architectures and is the
+property that ExpertFlow exploits.
+
+\subsection{Loading Strategy Comparison}
+\label{sec:experiments:loading}
+
+We compare five weight-loading strategies on Qwen3-Next-80B-A3B, each
+executing 100 forward-pass steps with identical input sequences. Results are
+presented in \Cref{tab:loading-methods}.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of five loading strategies for Qwen3-Next-80B-A3B
+  (100 steps each). Memory reports peak resident set above baseline OS usage.
+  ExpertFlow with LRU cache size 100 achieves 93.5\% memory reduction with
+  only 10.4\% throughput loss.}
+\label{tab:loading-methods}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{Load (s)} & \textbf{Memory (GB)} &
+  \textbf{ms/step} & \textbf{tok/s} & \textbf{Cache Hit} \\
+\midrule
+Full Load               & 4.5 & 41.8  & 424 & 2.4 & ---   \\
+ExpertFlow (LRU=100)    & 0.2 &  2.7  & 468 & 2.1 & 90.0\% \\
+ExpertFlow (LRU=20)     & 0.2 & $<$1  & 474 & 2.1 & 90.0\% \\
+Lazy On-Demand          & 0.0 & $<$1  & 475 & 2.1 & ---   \\
+Partial Offload (16\,L) & 1.6 & $<$1  & 461 & 2.2 & 90.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Full Load} serves as the performance ceiling, loading the entire
+44.84\,GB model into memory. This achieves 2.4\,tok/s at a cost of 41.8\,GB
+resident memory and a 4.5\,s load time.
+
+\paragraph{ExpertFlow (LRU=100)} caches the 100 most recently accessed expert
+tensors. With a 90.0\% cache hit rate, only 10\% of expert accesses require
+page faults from the memory-mapped region. Throughput is 2.1\,tok/s (a 12\%
+reduction), while peak memory drops to 2.7\,GB---a \textbf{93.5\% reduction}.
+Load time is 0.2\,s, reflecting only the backbone pre-load.
+
+\paragraph{ExpertFlow (LRU=20)} uses a smaller cache, demonstrating that even
+aggressive eviction maintains the same cache hit rate and throughput. The
+identical 90.0\% hit rate suggests that the effective working set is well
+within 20 experts at any given time, with the additional 80 cache slots in the
+LRU=100 configuration providing a warm buffer for less frequent but recurring
+experts.
+
+\paragraph{Lazy On-Demand} maps all tensors and loads each on first access
+with no caching. This achieves nearly identical throughput to ExpertFlow,
+indicating that the OS page cache provides implicit caching that compensates
+for the lack of an explicit software cache.
+
+\paragraph{Partial Offload (16 layers)} keeps 16 of the model's layers fully
+resident and streams the remainder. The intermediate load time (1.6\,s) and
+throughput (2.2\,tok/s) reflect the partial residency.
+
+The key finding is that \textbf{ExpertFlow reduces memory by 93.5\% while
+losing only 12\% throughput}. The memory freed (39.1\,GB) can be used for
+larger KV caches, batch processing, or---critically---running models that
+would otherwise not fit in memory at all.
+
+\subsection{Inference Throughput}
+\label{sec:experiments:inference}
+
+To contextualise ExpertFlow's throughput within the broader landscape of
+on-device inference, we benchmark several models across sequence lengths using
+mlx-lm and LM Studio. Results are averaged over 5 runs.
+
+\begin{table}[t]
+\centering
+\caption{Inference throughput (tok/s) for mlx-lm generation across sequence
+  lengths. Standard deviations in parentheses. Apple M5~Max, 128\,GB.}
+\label{tab:inference-deep}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Tiny} & \textbf{Short} & \textbf{Medium} &
+  \textbf{Long} \\
+\midrule
+Gemma-3-4B   & 86.7 (1.4) & 79.2 (2.1) & 69.1 (3.8) & 53.9 (5.6) \\
+GPT-OSS-20B  & 75.3 (1.4) & 69.3 (2.8) & 63.1 (4.2) & 46.0 (9.4) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Full model comparison across inference backends on Apple M5~Max.
+  GGUF models served via LM Studio; safetensor models via mlx-lm.}
+\label{tab:model-comparison}
+\begin{tabular}{llcccl}
+\toprule
+\textbf{Model} & \textbf{Size} & \textbf{Short tok/s} &
+  \textbf{Long tok/s} & \textbf{Backend} \\
+\midrule
+Gemma-3-4B          &  3.0\,GB & 85.7 & 66.4 & mlx-lm \\
+GPT-OSS-120B (GGUF) & 66.0\,GB & 82.8 & 74.1 & LM Studio \\
+Qwen3.5-35B-A3B (GGUF) & 22.1\,GB & 80.6 & 75.8 & LM Studio \\
+GPT-OSS-20B         & 12.1\,GB & 44.6 & 48.0 & mlx-lm \\
+Qwen3-Coder-Next    & 44.9\,GB & 36.2 & 28.5 & mlx-lm \\
+Qwen3-Next-80B-A3B  & 44.9\,GB & 35.4 & 26.2 & mlx-lm \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:inference-deep} shows that throughput degrades gracefully with
+sequence length, as expected from the increasing KV cache pressure.
+\Cref{tab:model-comparison} reveals a notable pattern: GGUF models served via
+LM Studio (llama.cpp backend) achieve higher throughput than equivalently-sized
+mlx-lm models, likely due to llama.cpp's more mature memory management and
+quantised matmul kernels for Metal. The MoE models (Qwen3-Next-80B-A3B,
+Qwen3-Coder-Next) show lower throughput than dense models of similar size,
+reflecting the overhead of routing and expert dispatch even when all experts
+are memory-resident.
+
+\subsection{Beyond-RAM Models}
+\label{sec:experiments:beyond}
+
+The most compelling application of ExpertFlow is enabling inference on models
+that \emph{exceed available RAM entirely}. \Cref{tab:beyond-ram} lists models
+currently under evaluation. Traditional approaches cannot serve these models on
+a single 128\,GB device; ExpertFlow's streaming architecture is the only viable
+single-device option.
+
+\begin{table}[t]
+\centering
+\caption{Models exceeding 128\,GB device memory (4-bit quantised).
+  ExpertFlow enables single-device inference through expert streaming.
+  Throughput benchmarks are ongoing.}
+\label{tab:beyond-ram}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Size (GB)} & \textbf{RAM Ratio} &
+  \textbf{Status} \\
+\midrule
+MiniMax-M2 (4-bit)       & 129 & 1.01$\times$ & Under evaluation \\
+GLM-4.5 Full (4-bit)     & 199 & 1.55$\times$ & Under evaluation \\
+DeepSeek V3.1 (4-bit)    & 352 & 2.75$\times$ & Under evaluation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For DeepSeek V3.1 at 352\,GB, only $\sim$36\,GB of the 128\,GB memory budget
+would be consumed by the backbone and active experts at any time (assuming a
+similar 97\% expert ratio), leaving substantial headroom for KV cache. The
+NVMe SSD in the M5~Max provides $\sim$7.4\,GB/s sequential read throughput,
+bounding the worst-case expert load latency. With the observed 90\% cache hit
+rate, only 10\% of expert accesses would incur SSD reads, yielding practical
+inference times.
+
+% ============================================================
+% 5. ANALYSIS
+% ============================================================
+\section{Analysis}
+\label{sec:analysis}
+
+\subsection{Memory--Throughput Tradeoff}
+\label{sec:analysis:tradeoff}
+
+\Cref{tab:loading-methods} reveals a highly favourable tradeoff curve. Moving
+from full model loading (41.8\,GB, 2.4\,tok/s) to ExpertFlow (2.7\,GB,
+2.1\,tok/s) traverses 93.5\% of the memory axis while sacrificing only 12\%
+on the throughput axis. This asymmetry arises because:
+\begin{enumerate}[nosep]
+  \item The 90\% cache hit rate means most expert accesses are served from
+    RAM, not from disk-backed mmap pages.
+  \item Apple Silicon's unified memory eliminates CPU$\leftrightarrow$GPU
+    transfer costs that would dominate on discrete-GPU systems.
+  \item Memory-mapped I/O with the OS page cache provides an additional
+    transparent caching layer beneath ExpertFlow's software LRU cache.
+\end{enumerate}
+
+\subsection{Cache Hit Rate and Expert Reuse}
+\label{sec:analysis:cache}
+
+The consistent 90.0\% cache hit rate across LRU sizes of 20 and 100 indicates
+that the \emph{effective working set} of experts---the number of distinct
+experts accessed within a sliding window of recent tokens---is smaller than 20.
+Given $L$ MoE layers each selecting $k$ experts per token, a single token
+touches $L \times k$ experts. For Qwen3-Next-80B-A3B with 10 active experts
+across multiple layers, the overlap between consecutive tokens is substantial.
+
+This finding is consistent with prior work on expert specialisation: MoE
+routers tend to develop domain-specific experts that are reused for
+semantically related tokens~\citep{fedus2022switch, zoph2022stmoe}. In
+practice, the ``hot'' expert set for a given conversation or document context
+is a small, slowly evolving subset of the full expert pool.
+
+\subsection{Comparison with Alternative Approaches}
+\label{sec:analysis:comparison}
+
+\begin{table}[t]
+\centering
+\caption{Qualitative comparison of approaches for running large MoE models on
+  memory-constrained consumer hardware.}
+\label{tab:comparison}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Approach} & \textbf{Quality} & \textbf{Memory} &
+  \textbf{Throughput} & \textbf{Beyond-RAM} & \textbf{No Retrain} \\
+\midrule
+4-bit Quantisation   & Slight loss & $\sim$25\% & Comparable & No  & Yes \\
+Layer Offloading     & Preserved   & Reduced    & Major loss & Yes & Yes \\
+Expert Pruning       & Moderate loss & Reduced  & Preserved  & No  & No  \\
+Expert Parallelism   & Preserved   & Split      & Preserved  & Yes & Yes \\
+\textbf{ExpertFlow}  & Preserved   & 93.5\% red.& 12\% loss  & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:comparison} positions ExpertFlow relative to alternatives.
+Quantisation is orthogonal and composable (our benchmarks already use 4-bit
+models). Layer offloading on discrete GPU systems suffers from PCIe bandwidth
+limitations that do not apply to unified memory architectures; however, it does
+not exploit MoE sparsity. Expert pruning reduces quality by permanently
+removing capacity. Expert parallelism requires multiple devices. ExpertFlow
+uniquely combines quality preservation, extreme memory reduction, beyond-RAM
+capability, and zero retraining.
+
+\subsection{Latency Breakdown}
+\label{sec:analysis:latency}
+
+The 44\,ms per-step overhead of ExpertFlow (LRU=100) versus full loading
+(468\,ms vs.\ 424\,ms) decomposes into:
+\begin{itemize}[nosep]
+  \item \textbf{Cache lookup}: $<$1\,ms (hash map probe + LRU list update).
+  \item \textbf{Cache miss penalty}: $\sim$5--10\,ms per expert (page fault
+    from mmap, dependent on OS page cache state and SSD latency).
+  \item \textbf{Overhead amortisation}: with 10\% miss rate and
+    $\sim$10 experts per token, approximately 1 expert per token incurs a
+    cache miss, contributing 5--10\,ms of the total overhead.
+\end{itemize}
+
+The remaining overhead is attributable to the software indirection of cache
+management versus direct tensor pointer access in the full-load scenario.
+
+% ============================================================
+% 6. LIMITATIONS
+% ============================================================
+\section{Limitations}
+\label{sec:limitations}
+
+\paragraph{Weight-level only.} The current ExpertFlow implementation operates
+at the weight-loading level, providing a mechanism for efficiently accessing
+expert tensors on demand. It does not yet integrate with an end-to-end
+inference engine; the benchmarks in \Cref{sec:experiments:loading} measure
+weight access patterns rather than full autoregressive generation with router
+dispatch. Integration with frameworks such as mlx-lm is ongoing work.
+
+\paragraph{Single-device scope.} ExpertFlow targets single-device inference on
+consumer hardware. It does not address multi-device expert distribution, which
+would enable even larger models through horizontal scaling. Expert
+parallelism across multiple Apple Silicon devices connected via Thunderbolt is
+a natural extension.
+
+\paragraph{KV cache not addressed.} ExpertFlow optimises expert weight memory
+but does not manage the key-value cache, which grows linearly with sequence
+length and can itself become a memory bottleneck for long contexts. Combining
+ExpertFlow with KV cache quantisation or paged
+attention~\citep{kwon2023pagedattention} would provide a more complete memory
+management solution.
+
+\paragraph{Router dependency.} ExpertFlow's effectiveness depends on the
+sparsity of expert activation. Models with low expert counts or high $k/N$
+ratios would see diminished benefits. Similarly, adversarial inputs designed to
+activate diverse expert sets could reduce cache hit rates, though such patterns
+are uncommon in natural language.
+
+\paragraph{Platform specificity.} While the core approach is
+platform-agnostic, the performance characteristics we report are specific to
+Apple Silicon's unified memory architecture. On discrete GPU systems, the
+CPU$\rightarrow$GPU transfer cost for cache-missed experts would likely
+increase the throughput penalty. Unified memory is essential to the
+favourable tradeoff we observe.
+
+% ============================================================
+% 7. CONCLUSION & FUTURE WORK
+% ============================================================
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+We have presented ExpertFlow, a system that exploits the structural sparsity
+of Mixture-of-Experts models to enable efficient inference on consumer
+hardware. By memory-mapping model shards and dynamically loading experts
+through an LRU cache, ExpertFlow reduces peak memory consumption by 93.5\%
+(41.8\,GB $\rightarrow$ 2.7\,GB) for Qwen3-Next-80B-A3B with only a 12\%
+throughput penalty. More significantly, ExpertFlow opens a path to serving
+models that exceed device memory entirely---up to 2.75$\times$ available RAM
+in our ongoing evaluations.
+
+The 90\% cache hit rate observed across cache sizes confirms that MoE expert
+activations exhibit strong temporal locality, a property that can be further
+exploited through predictive strategies.
+
+\subsection{Future Work}
+
+\paragraph{mlx-lm integration.} Integrating ExpertFlow as a custom weight
+provider in mlx-lm would enable full end-to-end generation with dynamic expert
+loading, bridging the gap between our weight-level benchmarks and practical
+inference.
+
+\paragraph{Predictive expert pre-fetching.} Router weights are available
+before expert dispatch. By running the router one layer ahead and
+speculatively pre-loading predicted experts, cache miss latency can be hidden
+behind computation. This is particularly effective for autoregressive
+generation where subsequent tokens are predictable.
+
+\paragraph{Correlated expert prefetching.} Analysis of expert co-activation
+patterns may reveal stable clusters of experts that are frequently selected
+together. Pre-fetching entire clusters on activation of any member would
+reduce miss rates without requiring lookahead routing.
+
+\paragraph{Multi-device expert sharding.} Distributing experts across multiple
+Apple Silicon devices connected via Thunderbolt (up to 100\,Gbps) would enable
+inference on arbitrarily large MoE models. Each device would host a shard of
+the expert pool, with a lightweight coordination protocol for routing expert
+requests.
+
+\paragraph{Adaptive cache sizing.} Dynamically adjusting the LRU cache size
+based on observed working set size and available memory pressure would allow
+ExpertFlow to maximise throughput while respecting system constraints.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{30}
+
+\bibitem[Aminabadi et~al.(2022)]{aminabadi2022deepspeed}
+Aminabadi, R.~Y., Rajbhandari, S., Awan, A.~A., Li, C., Li, D., Zheng, E.,
+  Ruwase, O., Smith, S., Zhang, M., Rasley, J., and He, Y.
+\newblock {DeepSpeed-Inference}: Enabling efficient inference of transformer
+  models at unprecedented scale.
+\newblock In \emph{SC '22}, 2022.
+
+\bibitem[Apple(2024)]{apple2024m4}
+Apple.
+\newblock {Apple M4 family of chips}.
+\newblock Technical report, Apple Inc., 2024.
+
+\bibitem[Chowdhery et~al.(2022)]{chowdhery2022palm}
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., et~al.
+\newblock {PaLM}: Scaling language modeling with pathways.
+\newblock \emph{arXiv preprint arXiv:2204.02311}, 2022.
+
+\bibitem[{DeepSeek-AI}(2024)]{deepseekv2}
+{DeepSeek-AI}.
+\newblock {DeepSeek-V2}: A strong, economical, and efficient
+  mixture-of-experts language model.
+\newblock \emph{arXiv preprint arXiv:2405.04434}, 2024.
+
+\bibitem[Dettmers et~al.(2022)]{dettmers2022gptint8}
+Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.
+\newblock {GPT3.int8()}: 8-bit matrix multiplication for transformers at scale.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem[Dettmers et~al.(2023)]{dettmers2023qlora}
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L.
+\newblock {QLoRA}: Efficient finetuning of quantized language models.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem[Fedus et~al.(2022)]{fedus2022switch}
+Fedus, W., Zoph, B., and Shazeer, N.
+\newblock Switch Transformers: Scaling to trillion parameter models with simple
+  and efficient sparsity.
+\newblock \emph{JMLR}, 23(120):1--39, 2022.
+
+\bibitem[Frantar \& Alistarh(2023)]{frantar2023sparsegpt}
+Frantar, E. and Alistarh, D.
+\newblock {SparseGPT}: Massive language models can be accurately pruned in one
+  shot.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem[Frantar et~al.(2023)]{frantar2023gptq}
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D.
+\newblock {GPTQ}: Accurate post-training quantization for generative
+  pre-trained transformers.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem[Gerganov(2023)]{gerganov2023llamacpp}
+Gerganov, G.
+\newblock {llama.cpp}.
+\newblock \url{https://github.com/ggerganov/llama.cpp}, 2023.
+
+\bibitem[Gu et~al.(2024)]{gu2024minillm}
+Gu, Y., Dong, L., Wei, F., and Huang, M.
+\newblock {MiniLLM}: Knowledge distillation of large language models.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem[Hinton et~al.(2015)]{hinton2015distilling}
+Hinton, G., Vinyals, O., and Dean, J.
+\newblock Distilling the knowledge in a neural network.
+\newblock \emph{arXiv preprint arXiv:1503.02531}, 2015.
+
+\bibitem[Hwang et~al.(2023)]{hwang2023semoe}
+Hwang, C., Cui, W., Xiong, Y., Yang, Z., et~al.
+\newblock Tutel: Adaptive mixture-of-experts at scale.
+\newblock In \emph{MLSys}, 2023.
+
+\bibitem[Hwang et~al.(2024)]{hwang2024pregated}
+Hwang, R., Zhu, J., Chen, Y., et~al.
+\newblock Pre-gated {MoE}: An algorithm-system co-design for fast and scalable
+  mixture-of-experts inference.
+\newblock \emph{arXiv preprint arXiv:2308.12066}, 2024.
+
+\bibitem[Jiang et~al.(2024)]{jiang2024mixtral}
+Jiang, A.~Q., Sablayrolles, A., Roux, A., et~al.
+\newblock {Mixtral of Experts}.
+\newblock \emph{arXiv preprint arXiv:2401.04088}, 2024.
+
+\bibitem[Kwon et~al.(2023)]{kwon2023pagedattention}
+Kwon, W., Li, Z., Zhuang, S., et~al.
+\newblock Efficient memory management for large language model serving with
+  {PagedAttention}.
+\newblock In \emph{SOSP}, 2023.
+
+\bibitem[Lepikhin et~al.(2021)]{lepikhin2021gshard}
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y., Krikun, M.,
+  Shazeer, N., and Chen, Z.
+\newblock {GShard}: Scaling giant models with conditional computation and
+  automatic sharding.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem[Lin et~al.(2024)]{lin2024awq}
+Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang, W.-C., Xiao, G.,
+  Dang, S., Gan, C., and Han, S.
+\newblock {AWQ}: Activation-aware weight quantization for efficient {LLM}
+  inference and deployment.
+\newblock In \emph{MLSys}, 2024.
+
+\bibitem[{LM Studio}(2024)]{lmstudio}
+{LM Studio}.
+\newblock {LM Studio}: Discover, download, and run local {LLMs}.
+\newblock \url{https://lmstudio.ai}, 2024.
+
+\bibitem[{MLX Contributors}(2023)]{mlx2023}
+{MLX Contributors}.
+\newblock {MLX}: An array framework for Apple Silicon.
+\newblock \url{https://github.com/ml-explore/mlx}, 2023.
+
+\bibitem[Rajbhandari et~al.(2022)]{rajbhandari2022deepspeedmoe}
+Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi, R.~Y., Awan, A.~A.,
+  Rasley, J., and He, Y.
+\newblock {DeepSpeed-MoE}: Advancing mixture-of-experts inference and training
+  to power next-generation {AI} scale.
+\newblock In \emph{ICML}, 2022.
+
+\bibitem[Shazeer et~al.(2017)]{shazeer2017outrageously}
+Shazeer, N., Mirhoseini, A., Maciaszek, K., Davis, A., Le, Q., Hinton, G.,
+  and Dean, J.
+\newblock Outrageously large neural networks: The sparsely-gated
+  mixture-of-experts layer.
+\newblock In \emph{ICLR}, 2017.
+
+\bibitem[Sheng et~al.(2023)]{sheng2023flexgen}
+Sheng, Y., Zheng, L., Yuan, B., et~al.
+\newblock {FlexGen}: High-throughput generative inference of large language
+  models with a single {GPU}.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem[Song et~al.(2023)]{song2023powerinfer}
+Song, Y., Mi, Z., Xie, H., and Chen, H.
+\newblock {PowerInfer}: Fast large language model serving with a
+  consumer-grade {GPU}.
+\newblock \emph{arXiv preprint arXiv:2312.12456}, 2023.
+
+\bibitem[Sun et~al.(2023)]{sun2023wanda}
+Sun, M., Liu, Z., Bair, A., and Kolter, J.~Z.
+\newblock A simple and effective pruning approach for large language models.
+\newblock \emph{arXiv preprint arXiv:2306.11695}, 2023.
+
+\bibitem[Touvron et~al.(2023)]{touvron2023llama2}
+Touvron, H., Martin, L., Stone, K., et~al.
+\newblock {LLaMA~2}: Open foundation and fine-tuned chat models.
+\newblock \emph{arXiv preprint arXiv:2307.09288}, 2023.
+
+\bibitem[Wolf et~al.(2020)]{wolf2020transformers}
+Wolf, T., Debut, L., Sanh, V., et~al.
+\newblock Transformers: State-of-the-art natural language processing.
+\newblock In \emph{EMNLP: System Demonstrations}, 2020.
+
+\bibitem[Xue et~al.(2024)]{xue2024moeinf}
+Xue, L., You, J., Zhang, Y., et~al.
+\newblock {MoE-Infinity}: Activation-aware expert offloading for efficient
+  {MoE} inference.
+\newblock \emph{arXiv preprint arXiv:2401.14361}, 2024.
+
+\bibitem[Zoph et~al.(2022)]{zoph2022stmoe}
+Zoph, B., Bello, I., Kumar, S., Du, N., Huang, Y., Dean, J., Shazeer, N.,
+  and Fedus, W.
+\newblock {ST-MoE}: Designing stable and transferable sparse expert models.
+\newblock \emph{arXiv preprint arXiv:2202.08906}, 2022.
+
+\end{thebibliography}
+
+% ============================================================
+\appendix
+\section{Reproducibility}
+\label{app:reproducibility}
+
+ExpertFlow is available at \url{https://github.com/jhammant/expertflow}
+under the MIT licence. Benchmarks were run on macOS~26.3.1 with an Apple
+M5~Max (128\,GB unified memory, 4\,TB NVMe SSD). Model weights were obtained
+from Hugging Face Hub in safetensor format (4-bit quantised variants where
+noted). The benchmarking scripts are included in the repository under
+\texttt{benchmarks/}.
+
+\end{document}

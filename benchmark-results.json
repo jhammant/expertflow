@@ -1,0 +1,23 @@
+{
+  "full_load": {
+    "load_time_s": 4.6,
+    "memory_gb": 41.8,
+    "access_per_step_ms": 1.5,
+    "tensors": 1891
+  },
+  "dynamic_load": {
+    "mmap_time_s": 0.006,
+    "backbone_load_time_s": 0.2,
+    "memory_gb": 2.7,
+    "access_per_step_ms": 41.9,
+    "cache_hit_rate": 90.0,
+    "cache_hits": 388800,
+    "cache_misses": 43200,
+    "backbone_tensors": 1459
+  },
+  "comparison": {
+    "memory_savings_pct": 93.5,
+    "load_time_savings_pct": 95.7,
+    "memory_freed_gb": 39.1
+  }
+}

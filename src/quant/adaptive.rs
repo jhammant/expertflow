@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::ExpertId;
 
@@ -231,7 +231,7 @@ impl AdaptiveQuantizer {
             *level_counts.entry(state.current_level).or_insert(0) += 1;
         }
 
-        let (total_bytes, savings_bytes, savings_pct) = drop(states); // Release lock
+        drop(states); // Release lock
         let (total_bytes, savings_bytes, savings_pct) = self.memory_savings();
 
         QuantizerStats {

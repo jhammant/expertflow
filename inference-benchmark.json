@@ -1,0 +1,32 @@
+[
+  {
+    "model": "Gemma-3-4B",
+    "size_gb": 3.0,
+    "load_time_s": 2.9,
+    "input_tokens": 8,
+    "output_tokens": 193,
+    "total_time_s": 2.45,
+    "generation_tok_s": 78.7,
+    "memory_gb": 3.3,
+    "response_preview": "\n\nOkay, let's break down quantum computing in a way that doesn't require a physics degree.\n\n**1. The Problem with Regular Computers**\n\n* **Bits:** Regular computers (the ones you use every day) store ",
+    "long_prompt_tokens": 57,
+    "long_output_tokens": 144,
+    "long_total_time_s": 2.25,
+    "long_generation_tok_s": 64.0
+  },
+  {
+    "model": "Qwen3-Next-80B-A3B",
+    "size_gb": 44.9,
+    "load_time_s": 3.4,
+    "input_tokens": 8,
+    "output_tokens": 192,
+    "total_time_s": 5.3,
+    "generation_tok_s": 36.2,
+    "memory_gb": 39.2,
+    "response_preview": "Sure! Let\u2019s break it down in simple terms:\n\n### What is Quantum Computing?\n\nImagine you have a regular computer \u2014 like your laptop or phone. It works using bits, which are tiny switches that can be ei",
+    "long_prompt_tokens": 56,
+    "long_output_tokens": 144,
+    "long_total_time_s": 6.06,
+    "long_generation_tok_s": 23.8
+  }
+]
