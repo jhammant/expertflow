@@ -1,0 +1,10 @@
+{
+  "prompt": "The capital of France is",
+  "output": " Paris. Paris is located",
+  "tokens": 5,
+  "prefill_s": 214.41,
+  "decode_avg_s": 61.71,
+  "decode_tok_s": 0.0162,
+  "total_s": 461.3,
+  "expert_cache_hit_rate": 0.0
+}

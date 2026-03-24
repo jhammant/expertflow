@@ -1,0 +1,12 @@
+{
+  "prompt": "The capital of France is",
+  "output": " Paris. Paris",
+  "tokens_generated": 3,
+  "prefill_s": 38.49,
+  "decode_avg_s": 295.71,
+  "decode_tok_s": 0.0034,
+  "total_s": 629.9,
+  "avg_moe_layer_ms": 3398.5,
+  "avg_dense_layer_ms": 11.0,
+  "num_layers": 92
+}

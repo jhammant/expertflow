@@ -1,0 +1,16 @@
+{
+  "prompt": "The capital of France is",
+  "output": "one of the most visited cities in the world.",
+  "tokens": 10,
+  "prefill_s": 0.12,
+  "decode_avg_s": 0.05,
+  "decode_tok_s": 20.6667,
+  "total_s": 0.6,
+  "model_info": {
+    "layers": 32,
+    "moe": 32,
+    "dense": 0,
+    "arch": "mixtral"
+  },
+  "stream_experts": false
+}

@@ -1,0 +1,10 @@
+{
+  "prompt": "The capital of France is",
+  "output": "one of the most visited cities in the world.",
+  "tokens": 10,
+  "prefill_s": 0.75,
+  "decode_avg_s": 0.03,
+  "decode_tok_s": 29.4414,
+  "total_s": 1.1,
+  "eval_every": 4
+}

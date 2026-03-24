@@ -1,0 +1,29 @@
+[
+  {
+    "approach": "native_mlx_lm",
+    "output": "one of the most visited cities in the world. It is famous for its museums, theaters",
+    "tokens": 20,
+    "prefill_s": 0.1,
+    "total_s": 0.396,
+    "tok_s": 50.5,
+    "decode_tok_s": 64.19
+  },
+  {
+    "approach": "layerwise_native_moe",
+    "output": "one of the most visited cities in the world. It is famous for its museums, theaters",
+    "tokens": 20,
+    "prefill_s": 0.086,
+    "total_s": 0.61,
+    "tok_s": 32.76,
+    "decode_tok_s": 36.21
+  },
+  {
+    "approach": "layerwise_qmatmul",
+    "output": "one of the most visited cities in the world. It is famous for its museums, theaters",
+    "tokens": 20,
+    "prefill_s": 0.417,
+    "total_s": 1.763,
+    "tok_s": 11.35,
+    "decode_tok_s": 14.12
+  }
+]
