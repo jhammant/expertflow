@@ -377,11 +377,12 @@ class ExpertMmapLoader:
 
         # Parse GGUF files
         self.file_infos, self.tensors, self.metadata = parse_split_gguf(model_dir)
-        self.n_experts = self.metadata.get('deepseek2.expert_count', 256)
+        self.n_experts = self.metadata.get('deepseek2.expert_count',
+                         self.metadata.get('llama.expert_count', 256))
         self.n_layers = self.metadata.get('deepseek2.block_count',
                         self.metadata.get('llama.block_count', 61))
         self.first_moe_layer = self.metadata.get('deepseek2.leading_dense_block_count',
-                               self.metadata.get('deepseek2.first_k_dense_replace', 3))
+                               self.metadata.get('deepseek2.first_k_dense_replace', 0))
 
         # mmap all GGUF files
         self._mmaps = []
@@ -412,14 +413,17 @@ class ExpertMmapLoader:
                 print(f"  Total per expert: {stride * 3 / 1024 / 1024:.1f} MB (gate+up+down)")
 
     def _build_expert_layout(self):
-        """Pre-compute byte offsets for expert slices within stacked tensors."""
+        """Pre-compute byte offsets for expert slices.
+
+        Supports two GGUF naming conventions:
+          - DeepSeek/stacked: blk.{i}.ffn_gate_exps.weight  shape=(n_experts, rows, cols)
+          - Mixtral/per-expert: blk.{i}.ffn_gate.{e}.weight shape=(rows, cols)
+        """
+        # First pass: try stacked (DeepSeek-style, _exps suffix)
         for name, tinfo in self.tensors.items():
-            # Match expert weight tensors: blk.{i}.ffn_{gate|up|down}_exps.weight
             if 'ffn_' not in name or '_exps' not in name:
                 continue
-
             parts = name.split('.')
-            # Parse layer index
             layer_idx = None
             for j, p in enumerate(parts):
                 if p == 'blk' and j + 1 < len(parts):
@@ -427,11 +431,9 @@ class ExpertMmapLoader:
                         layer_idx = int(parts[j + 1])
                     except ValueError:
                         pass
-
             if layer_idx is None:
                 continue
 
-            # Determine projection type
             if 'gate_exps' in name:
                 proj = 'gate'
             elif 'up_exps' in name:
@@ -441,16 +443,10 @@ class ExpertMmapLoader:
             else:
                 continue
 
-            # Shape: (n_experts, rows, cols) or (n_experts, rows*cols) depending on format
-            # For stacked expert tensors, first dim is n_experts
             file_info = self.file_infos[tinfo.file_idx]
             abs_offset = file_info.data_offset + tinfo.offset
+            expert_bytes = tinfo.total_bytes // self.n_experts
 
-            # Calculate per-expert stride
-            total_bytes = tinfo.total_bytes
-            expert_bytes = total_bytes // self.n_experts
-
-            # Expert shape (single expert's weight)
             if len(tinfo.shape) == 3:
                 expert_shape = (tinfo.shape[1], tinfo.shape[2])
             elif len(tinfo.shape) == 2:
@@ -462,13 +458,85 @@ class ExpertMmapLoader:
                 tinfo.file_idx, abs_offset, expert_bytes, tinfo.dtype, expert_shape
             )
 
+        # Second pass: per-expert tensors (Mixtral-style: blk.{i}.ffn_gate.{e}.weight)
+        # Build a map from (layer, proj, expert_idx) -> tinfo
+        per_expert = {}  # (layer, proj, eidx) -> tinfo
+        for name, tinfo in self.tensors.items():
+            # Pattern: blk.{layer}.ffn_{gate|up|down}.{eidx}.weight
+            if 'ffn_' not in name or '_exps' in name:
+                continue
+            parts = name.split('.')
+            # Expected: ['blk', '{layer}', 'ffn_{proj}', '{eidx}', 'weight']
+            if len(parts) < 5 or parts[0] != 'blk' or parts[-1] != 'weight':
+                continue
+            try:
+                layer_idx = int(parts[1])
+                eidx = int(parts[3])
+            except ValueError:
+                continue
+            proj_part = parts[2]  # e.g. 'ffn_gate', 'ffn_up', 'ffn_down'
+            if proj_part == 'ffn_gate':
+                proj = 'gate'
+            elif proj_part == 'ffn_up':
+                proj = 'up'
+            elif proj_part == 'ffn_down':
+                proj = 'down'
+            else:
+                continue
+            per_expert[(layer_idx, proj, eidx)] = tinfo
+
+        if per_expert:
+            # Detect n_experts from per-expert tensors
+            max_eidx = max(k[2] for k in per_expert) + 1
+            if self.n_experts == 256 and max_eidx < 256:
+                self.n_experts = max_eidx
+
+            # Build layout: store list of (file_idx, abs_offset, bytes, dtype, shape)
+            # indexed by (layer, proj) -> list ordered by expert_idx
+            layer_proj_experts = {}
+            for (layer_idx, proj, eidx), tinfo in per_expert.items():
+                key = (layer_idx, proj)
+                if key not in layer_proj_experts:
+                    layer_proj_experts[key] = {}
+                file_info = self.file_infos[tinfo.file_idx]
+                abs_offset = file_info.data_offset + tinfo.offset
+                layer_proj_experts[key][eidx] = (
+                    tinfo.file_idx, abs_offset, tinfo.total_bytes, tinfo.dtype, tinfo.shape
+                )
+
+            # Store per-expert index for Mixtral-style access
+            self._per_expert_layout = layer_proj_experts
+
+            # Also populate _expert_layout with the stride of expert 0 for display
+            for (layer_idx, proj), experts in layer_proj_experts.items():
+                if (layer_idx, proj) not in self._expert_layout and 0 in experts:
+                    file_idx, abs_off, ebytes, dtype, shape = experts[0]
+                    self._expert_layout[(layer_idx, proj)] = (
+                        file_idx, abs_off, ebytes, dtype, shape
+                    )
+        else:
+            self._per_expert_layout = {}
+
     def load_expert_raw(self, layer_idx, expert_idx, proj='gate'):
         """Load raw quantized bytes for a single expert from mmap.
 
         Returns (raw_bytes, dtype, shape) without dequantization.
-        This is the core mmap operation — triggers NVMe page-in for just this expert.
+        Supports both stacked (DeepSeek) and per-expert (Mixtral) layouts.
         """
         key = (layer_idx, proj)
+
+        # Try per-expert layout first (Mixtral-style)
+        if self._per_expert_layout and key in self._per_expert_layout:
+            experts = self._per_expert_layout[key]
+            if expert_idx not in experts:
+                raise KeyError(f"Expert {expert_idx} not found in layer {layer_idx}, proj {proj}")
+            file_idx, abs_offset, expert_bytes, dtype, shape = experts[expert_idx]
+            mm = self._mmaps[file_idx]
+            raw = mm[abs_offset:abs_offset + expert_bytes]
+            self.bytes_read += expert_bytes
+            return bytes(raw), dtype, shape
+
+        # Stacked layout (DeepSeek-style)
         if key not in self._expert_layout:
             raise KeyError(f"No expert layout for layer {layer_idx}, proj {proj}")
 
@@ -489,15 +557,15 @@ class ExpertMmapLoader:
         results = {}
         for proj in ('gate', 'up', 'down'):
             raw, dtype, shape = self.load_expert_raw(layer_idx, expert_idx, proj)
+            arr = np.frombuffer(raw, dtype=np.uint8)
             if dtype == GGML_TYPE_Q2_K:
-                results[proj] = dequant_q2_k_fast(np.frombuffer(raw, dtype=np.uint8), shape)
-            elif dtype == GGML_TYPE_F16:
-                results[proj] = np.frombuffer(raw, dtype=np.float16).reshape(shape)
-            elif dtype == GGML_TYPE_F32:
-                results[proj] = np.frombuffer(raw, dtype=np.float32).reshape(shape).astype(np.float16)
+                results[proj] = dequant_q2_k_fast(arr, shape)
             elif dtype == GGML_TYPE_Q4_K:
-                # For Q4_K, use a simplified dequant (TODO: full implementation)
-                results[proj] = _dequant_generic(raw, dtype, shape)
+                results[proj] = dequant_q4_k_fast(arr, shape)
+            elif dtype == GGML_TYPE_F16:
+                results[proj] = arr.view(np.float16).reshape(shape)
+            elif dtype == GGML_TYPE_F32:
+                results[proj] = arr.view(np.float32).reshape(shape).astype(np.float16)
             else:
                 results[proj] = _dequant_generic(raw, dtype, shape)
 
@@ -556,6 +624,68 @@ class ExpertMmapLoader:
             mm.close()
         for f in self._files:
             f.close()
+
+
+def dequant_q4_k_fast(data, shape):
+    """Vectorized Q4_K dequantization to float16.
+
+    Q4_K block layout (144 bytes for 256 elements, QK_K=256):
+      - d:         float16  — super-block scale  (offset 0, 2 bytes)
+      - dmin:      float16  — super-block min    (offset 2, 2 bytes)
+      - scales[12]: uint8   — 6-bit scale+min packed for 8 sub-blocks (offset 4, 12 bytes)
+      - qs[128]:   uint8    — 4-bit quants, 2 per byte (offset 16, 128 bytes)
+    Total: 144 bytes, 8 sub-blocks of 32 elements each.
+
+    Scale packing (from ggml-quants.c): each sub-block i has a 6-bit scale and 6-bit min.
+    Bytes 0-7:  lower 6 bits = sc[0..7], bits [6:8] = upper 2 bits of mn[0..7] (interleaved)
+    Bytes 8-11: upper bits of sc and mn
+    Exact encoding: sc[i] = scales[i] & 0x3F; mn[i] = (scales[i+4] & 0x3F) | ... (complex)
+    We use the standard llama.cpp approach below.
+    """
+    n_elements = 1
+    for d in shape:
+        n_elements *= d
+    n_blocks = n_elements // QK_K
+    block_bytes = 144
+
+    raw_arr = np.frombuffer(data[:n_blocks * block_bytes], dtype=np.uint8).reshape(n_blocks, block_bytes)
+
+    # Parse super-block d and dmin
+    d_vals    = np.frombuffer(raw_arr[:, 0:2].tobytes(), dtype=np.float16).reshape(n_blocks).astype(np.float32)
+    dmin_vals = np.frombuffer(raw_arr[:, 2:4].tobytes(), dtype=np.float16).reshape(n_blocks).astype(np.float32)
+
+    # scales bytes: offset 4..15 (12 bytes for 8 sub-blocks)
+    # Layout (ggml Q4_K, QK_K=256):
+    #   bytes[0..7]:  lower 6 bits = sc[0..7], bits[6:8] = upper bits of mn[0..3] / sc[4..7]
+    #   bytes[8..11]: lower 6 bits = mn[0..7] >> 4 packed
+    # Simpler approach: extract directly per ggml reference implementation
+    s = raw_arr[:, 4:16]  # (n_blocks, 12)
+    # sc[0..7]: lower 6 bits of bytes 0..7, with upper bits from bytes 8..11
+    sc = np.zeros((n_blocks, 8), dtype=np.float32)
+    mn = np.zeros((n_blocks, 8), dtype=np.float32)
+    sc[:, :4] = (s[:, 0:4] & 0x3F).astype(np.float32)
+    sc[:, 4:] = (s[:, 4:8] & 0x3F).astype(np.float32)
+    mn[:, :4] = (s[:, 8:12] & 0x3F).astype(np.float32)
+    mn[:, 4:] = ((s[:, 0:4] >> 6) | ((s[:, 8:12] >> 2) & 0x30)).astype(np.float32)
+
+    # Unpack 4-bit values: qs[128] → 256 values
+    qs = raw_arr[:, 16:144]  # (n_blocks, 128)
+    q_lo = (qs & 0x0F).astype(np.float32)    # (n_blocks, 128) lower nibble
+    q_hi = ((qs >> 4) & 0x0F).astype(np.float32)  # (n_blocks, 128) upper nibble
+
+    # Interleave: first 128 values from lo nibble, next 128 from hi nibble
+    quants = np.empty((n_blocks, QK_K), dtype=np.float32)
+    quants[:, :128] = q_lo
+    quants[:, 128:] = q_hi
+
+    # Expand scale/min per sub-block (32 elements each, 8 sub-blocks)
+    sc_exp = np.repeat(sc, 32, axis=1)   # (n_blocks, 256)
+    mn_exp = np.repeat(mn, 32, axis=1)
+    d_exp  = d_vals[:, None]
+    dm_exp = dmin_vals[:, None]
+
+    result = d_exp * sc_exp * quants - dm_exp * mn_exp
+    return result.reshape(shape).astype(np.float16)
 
 
 def _dequant_generic(raw, dtype, shape):
@@ -1582,10 +1712,11 @@ def main():
         print(f"  down: {down.shape} {down.dtype}")
         print(f"  Bytes read: {loader.bytes_read / 1024 / 1024:.1f}MB")
 
-        # Benchmark multiple loads
-        print(f"\n  Benchmarking 10 expert loads...")
+        # Benchmark multiple loads (stay within n_experts)
+        n_bench = min(10, loader.n_experts)
+        print(f"\n  Benchmarking {n_bench} expert loads (warm mmap)...")
         t0 = time.time()
-        for eidx in range(10):
+        for eidx in range(n_bench):
             gate, up, down = loader.load_expert_dequantized(loader.first_moe_layer, eidx)
         dt = time.time() - t0
         print(f"  10 experts in {dt*1000:.0f}ms ({dt*100:.0f}ms/expert)")
