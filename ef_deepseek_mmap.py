@@ -48,45 +48,61 @@ import numpy as np
 GGUF_MAGIC = 0x46554747  # "GGUF"
 GGUF_VERSION = 3
 
-# GGML quantization type IDs
-GGML_TYPE_F32   = 0
-GGML_TYPE_F16   = 1
-GGML_TYPE_Q4_0  = 2
-GGML_TYPE_Q4_1  = 3
-GGML_TYPE_Q5_0  = 6
-GGML_TYPE_Q5_1  = 7
-GGML_TYPE_Q8_0  = 8
-GGML_TYPE_Q8_1  = 9
-GGML_TYPE_Q2_K  = 10
-GGML_TYPE_Q3_K  = 11
-GGML_TYPE_Q4_K  = 12
-GGML_TYPE_Q5_K  = 13
-GGML_TYPE_Q6_K  = 14
-GGML_TYPE_Q8_K  = 15
-GGML_TYPE_IQ1_S = 24
-GGML_TYPE_BF16  = 30
+# GGML quantization type IDs (from ggml.h)
+GGML_TYPE_F32     = 0
+GGML_TYPE_F16     = 1
+GGML_TYPE_Q4_0    = 2
+GGML_TYPE_Q4_1    = 3
+GGML_TYPE_Q5_0    = 6
+GGML_TYPE_Q5_1    = 7
+GGML_TYPE_Q8_0    = 8
+GGML_TYPE_Q8_1    = 9
+GGML_TYPE_Q2_K    = 10
+GGML_TYPE_Q3_K    = 11
+GGML_TYPE_Q4_K    = 12
+GGML_TYPE_Q5_K    = 13
+GGML_TYPE_Q6_K    = 14
+GGML_TYPE_Q8_K    = 15
+GGML_TYPE_IQ2_XXS = 16
+GGML_TYPE_IQ2_XS  = 17
+GGML_TYPE_IQ3_XXS = 18
+GGML_TYPE_IQ1_S   = 19   # ← was wrong (was 24)
+GGML_TYPE_IQ4_NL  = 20
+GGML_TYPE_IQ3_S   = 21
+GGML_TYPE_IQ2_S   = 22
+GGML_TYPE_IQ4_XS  = 23
+GGML_TYPE_IQ1_M   = 29
+GGML_TYPE_BF16    = 30
 
 # Block sizes (QK_K = 256 for K-quants)
 QK_K = 256
 
-# Bytes per block for each quantization type
+# (block_elements, block_bytes) for each type
 GGML_BLOCK_SIZES = {
-    GGML_TYPE_F32:   (1, 4),      # block_size=1, 4 bytes
-    GGML_TYPE_F16:   (1, 2),      # block_size=1, 2 bytes
-    GGML_TYPE_BF16:  (1, 2),
-    GGML_TYPE_Q4_0:  (32, 18),    # 32 elements, 18 bytes
-    GGML_TYPE_Q4_1:  (32, 20),
-    GGML_TYPE_Q5_0:  (32, 22),
-    GGML_TYPE_Q5_1:  (32, 24),
-    GGML_TYPE_Q8_0:  (32, 34),
-    GGML_TYPE_Q8_1:  (32, 36),
-    GGML_TYPE_Q2_K:  (QK_K, 84),  # 256 elements, 84 bytes
-    GGML_TYPE_Q3_K:  (QK_K, 110),
-    GGML_TYPE_Q4_K:  (QK_K, 144),
-    GGML_TYPE_Q5_K:  (QK_K, 176),
-    GGML_TYPE_Q6_K:  (QK_K, 210),
-    GGML_TYPE_Q8_K:  (QK_K, 292),
-    GGML_TYPE_IQ1_S: (QK_K, 50),
+    GGML_TYPE_F32:     (1,     4),
+    GGML_TYPE_F16:     (1,     2),
+    GGML_TYPE_BF16:    (1,     2),
+    GGML_TYPE_Q4_0:    (32,   18),
+    GGML_TYPE_Q4_1:    (32,   20),
+    GGML_TYPE_Q5_0:    (32,   22),
+    GGML_TYPE_Q5_1:    (32,   24),
+    GGML_TYPE_Q8_0:    (32,   34),
+    GGML_TYPE_Q8_1:    (32,   36),
+    GGML_TYPE_Q2_K:    (QK_K, 84),
+    GGML_TYPE_Q3_K:    (QK_K, 110),
+    GGML_TYPE_Q4_K:    (QK_K, 144),
+    GGML_TYPE_Q5_K:    (QK_K, 176),
+    GGML_TYPE_Q6_K:    (QK_K, 210),
+    GGML_TYPE_Q8_K:    (QK_K, 292),
+    GGML_TYPE_IQ1_S:   (QK_K, 50),   # d(2) + qs(32) + qh(16)
+    GGML_TYPE_IQ1_M:   (QK_K, 56),   # d(2) + qs(32) + qh(16) + scales(6)
+    GGML_TYPE_IQ2_XXS: (QK_K, 66),
+    GGML_TYPE_IQ2_XS:  (QK_K, 74),
+    GGML_TYPE_IQ2_S:   (QK_K, 84),
+    GGML_TYPE_IQ3_XXS: (QK_K, 98),
+    GGML_TYPE_IQ3_S:   (QK_K, 110),
+    GGML_TYPE_IQ4_NL:  (32,   18),
+    GGML_TYPE_IQ4_XS:  (QK_K, 136),
 }
 
 # GGUF value types
