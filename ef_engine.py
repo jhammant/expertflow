@@ -829,28 +829,33 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts="auto",
         moe_time = 0
 
         for i, layer in enumerate(model.model.layers):
-            # Attention with KV cache (GPU)
-            t_a = time.time()
-            h = layer.input_layernorm(x)
-            h = layer.self_attn(h, mask, tiered_kv[i])
-            x = x + h
-            mx.eval(x)
-            attn_time += time.time() - t_a
+            if stream_experts and i in moe_indices:
+                # Streaming path: need evals for CPU/GPU sync
+                t_a = time.time()
+                h = layer.input_layernorm(x)
+                h = layer.self_attn(h, mask, tiered_kv[i])
+                x = x + h
+                mx.eval(x)
+                attn_time += time.time() - t_a
 
-            # MoE / MLP
-            t_m = time.time()
-            h = layer.post_attention_layernorm(x)
-
-            moe_mod = get_moe_module(layer)
-            if i in moe_indices and stream_experts:
-                h = streaming_moe_forward(moe_mod, h, expert_cache)
+                t_m = time.time()
+                h = layer.post_attention_layernorm(x)
+                h = streaming_moe_forward(get_moe_module(layer), h, expert_cache)
+                x = x + h
+                mx.eval(x)
+                moe_time += time.time() - t_m
             else:
+                # Native GPU path: minimal evals, let MLX batch operations
+                h = layer.input_layernorm(x)
+                h = layer.self_attn(h, mask, tiered_kv[i])
+                x = x + h
+                h = layer.post_attention_layernorm(x)
+                moe_mod = get_moe_module(layer)
                 h = moe_mod(h)
-                mx.eval(h)
-
-            x = x + h
-            mx.eval(x)
-            moe_time += time.time() - t_m
+                x = x + h
+                # Eval every 16 layers for GPU batching (1-2 syncs for typical models)
+                if (i + 1) % 16 == 0 or i == num_layers - 1:
+                    mx.eval(x)
 
             if verbose and (i + 1) % 10 == 0:
                 mem = free_gb()
