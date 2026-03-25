@@ -5,3 +5,30 @@ target/
 logs/
 __pycache__/
 *.pyc
+
+# Python virtualenv & tooling
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Benchmark run outputs (transient JSON results)
+ef_run_*.json
+ef_mmap_*.json
+benchmark_deepseek_*.json
+benchmark_integrated_*.json
+v24_*.json
+v25_*.json
+experiments/*.json
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
