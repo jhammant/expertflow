@@ -817,49 +817,50 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts="auto",
         else:
             ids = mx.array([[generated_ids[-1]]])
 
-        x = model.model.embed_tokens(ids)
-        mx.eval(x)
+        if not stream_experts:
+            # Turbo path: use model() directly — fused ops, ~60 tok/s
+            logits = model(ids, cache=tiered_kv.kv_caches)
+            mx.eval(logits)
+        else:
+            # Streaming path: per-layer with expert cache for oversized models
+            x = model.model.embed_tokens(ids)
+            mx.eval(x)
 
-        seq_len = ids.shape[1]
-        kv0 = tiered_kv[0]
-        cache_offset = kv0.offset if not kv0.empty() else 0
-        mask = create_mask(seq_len, cache_offset)
+            seq_len = ids.shape[1]
+            kv0 = tiered_kv[0]
+            cache_offset = kv0.offset if not kv0.empty() else 0
+            mask = create_mask(seq_len, cache_offset)
 
-        attn_time = 0
-        moe_time = 0
-
-        for i, layer in enumerate(model.model.layers):
-            if stream_experts and i in moe_indices:
-                # Streaming path: need evals for CPU/GPU sync
-                t_a = time.time()
-                h = layer.input_layernorm(x)
-                h = layer.self_attn(h, mask, tiered_kv[i])
-                x = x + h
-                mx.eval(x)
-                attn_time += time.time() - t_a
-
-                t_m = time.time()
-                h = layer.post_attention_layernorm(x)
-                h = streaming_moe_forward(get_moe_module(layer), h, expert_cache)
-                x = x + h
-                mx.eval(x)
-                moe_time += time.time() - t_m
-            else:
-                # Native GPU path: minimal evals, let MLX batch operations
-                h = layer.input_layernorm(x)
-                h = layer.self_attn(h, mask, tiered_kv[i])
-                x = x + h
-                h = layer.post_attention_layernorm(x)
-                moe_mod = get_moe_module(layer)
-                h = moe_mod(h)
-                x = x + h
-                # Eval every 16 layers for GPU batching (1-2 syncs for typical models)
-                if (i + 1) % 16 == 0 or i == num_layers - 1:
+            for i, layer in enumerate(model.model.layers):
+                if i in moe_indices:
+                    t_a = time.time()
+                    h = layer.input_layernorm(x)
+                    h = layer.self_attn(h, mask, tiered_kv[i])
+                    x = x + h
                     mx.eval(x)
 
-            if verbose and (i + 1) % 10 == 0:
+                    h = layer.post_attention_layernorm(x)
+                    h = streaming_moe_forward(get_moe_module(layer), h, expert_cache)
+                    x = x + h
+                    mx.eval(x)
+                else:
+                    h = layer.input_layernorm(x)
+                    h = layer.self_attn(h, mask, tiered_kv[i])
+                    x = x + h
+                    h = layer.post_attention_layernorm(x)
+                    h = get_moe_module(layer)(h)
+                    x = x + h
+                    if (i + 1) % 16 == 0 or i == num_layers - 1:
+                        mx.eval(x)
+
+            # Logits for streaming path
+            x = model.model.norm(x[:, -1:, :])
+            logits = model.lm_head(x)
+            mx.eval(logits)
+
+            if verbose and step <= 1:
                 mem = free_gb()
-                print(f"[L{i+1} {mem:.0f}G]", end=" ", flush=True)
+                print(f"[{mem:.0f}G]", end=" ", flush=True)
 
         # Trim expert cache and finalize token trace
         if expert_cache is not None:
@@ -870,12 +871,8 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts="auto",
         # Tier cold KV blocks to SSD if RAM pressure is high
         tiered_kv.maybe_tier_to_ssd(step)
 
-        # Logits
-        x = model.model.norm(x[:, -1:, :])
-        logits = model.lm_head(x)
-        mx.eval(logits)
-
-        next_id = int(mx.argmax(logits[0, 0]).item())
+        # Extract next token — logits[:, -1, :] for both prefill and decode
+        next_id = int(mx.argmax(logits[0, -1]).item())
         generated_ids.append(next_id)
 
         dt = time.time() - t_token
@@ -887,14 +884,13 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts="auto",
             except:
                 text = f"[{next_id}]"
             mode = "prefill" if step == 0 else "decode"
-            cache_info = ""
+            parts = [f"T{step+1}({mode}): {text!r} | {dt:.2f}s ({1/dt:.1f} tok/s)"]
             if expert_cache is not None:
-                cache_info = (f" | hit {expert_cache.token_hit_rate:.0f}% "
-                              f"({len(expert_cache.cache)} cached)")
-            print(f"\n  T{step+1}({mode}): {text!r} | "
-                  f"{dt:.1f}s ({1/dt:.3f} tok/s) | "
-                  f"attn={attn_time:.1f}s moe={moe_time:.1f}s"
-                  f"{cache_info}", flush=True)
+                parts.append(f"hit {expert_cache.token_hit_rate:.0f}% "
+                             f"({len(expert_cache.cache)} cached)")
+            # Only print every 10 tokens or first 3 to reduce output noise
+            if step < 3 or (step + 1) % 10 == 0 or step == max_tokens - 1:
+                print(f"\n  {' | '.join(parts)}", flush=True)
 
     try:
         output_text = tokenizer.decode(generated_ids)
