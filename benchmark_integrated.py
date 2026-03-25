@@ -28,7 +28,17 @@ import json
 import os
 import sys
 import time
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    print(
+        "Error: numpy is required but not installed.\n"
+        "Install it with:  pip install numpy\n"
+        "Or inside a venv: pip install -r requirements.txt",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 __version__ = "0.1.0"
 
@@ -63,14 +73,23 @@ def _output_path(value):
         )
     return value
 
-from ef_integrated_engine import (
-    ExpertFlowEngine,
-    ModelConfig,
-    DEEPSEEK_V3_CONFIG,
-    DEEPSEEK_V3_SMALL_SIM,
-    MIXTRAL_8X7B_CONFIG,
-    EvictionPolicy,
-)
+try:
+    from ef_integrated_engine import (
+        ExpertFlowEngine,
+        ModelConfig,
+        DEEPSEEK_V3_CONFIG,
+        DEEPSEEK_V3_SMALL_SIM,
+        MIXTRAL_8X7B_CONFIG,
+        EvictionPolicy,
+    )
+except ImportError as e:
+    print(
+        f"Error: could not import ExpertFlow engine modules: {e}\n"
+        "Make sure you are running from the project root directory\n"
+        "and that all dependencies are installed (pip install numpy).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def format_bytes(b: int) -> str:
