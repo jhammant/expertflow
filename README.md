@@ -5,6 +5,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/jhammant/expertflow/actions/workflows/tests.yml"><img src="https://github.com/jhammant/expertflow/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <a href="https://github.com/jhammant/expertflow"><img src="https://img.shields.io/badge/Rust-2021-DEA584?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"></a>
   <a href="https://github.com/jhammant/expertflow"><img src="https://img.shields.io/badge/Apple_Silicon-M1→M5-000000?style=for-the-badge&logo=apple" alt="Apple Silicon"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License"></a>
