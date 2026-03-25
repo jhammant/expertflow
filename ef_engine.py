@@ -715,7 +715,29 @@ def create_mask(seq_len, cache_offset):
     return create_causal_mask(seq_len, cache_offset)
 
 
-def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
+def estimate_model_size_gb(model):
+    """Estimate model weight size in GB from safetensor files or parameter count."""
+    # Try to find model directory from config
+    for attr in ['_model_path', 'config', '_name_or_path']:
+        path = getattr(model, attr, None)
+        if isinstance(path, str) and os.path.isdir(path):
+            total = sum(
+                os.path.getsize(os.path.join(path, f))
+                for f in os.listdir(path) if f.endswith('.safetensors')
+            )
+            if total > 0:
+                return total / 1024**3
+    # Fallback: count leaf arrays in the model tree
+    try:
+        import mlx.utils
+        leaves = mlx.utils.tree_flatten(model.parameters())
+        n_elements = sum(v.size for _, v in leaves)
+        return n_elements * 0.5 / 1024**3  # assume 4-bit avg
+    except Exception:
+        return 0  # unknown → assume fits in RAM (no streaming)
+
+
+def generate(model, tokenizer, prompt, max_tokens, stream_experts="auto",
              pin_attn=True, cache_budget=300, eviction_policy="freq",
              predictor_path=None, kv_hot_gb=5.0, kv_ssd_gb=50.0,
              verbose=True):
@@ -723,8 +745,8 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
     Generate tokens with ExpertFlow engine.
 
     Args:
-        stream_experts: If True, use per-expert streaming (for oversized models).
-                       If False, use native MoE forward (for fits-in-RAM models).
+        stream_experts: "auto" (detect from model size), True (force streaming),
+                       False (force native GPU MoE).
         pin_attn: If True, pre-evaluate attention weights to keep in page cache.
         cache_budget: Max number of expert weight sets to keep in cache.
         eviction_policy: "freq" (frequency-weighted), "belady" (learned), or "lru".
@@ -736,12 +758,23 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
     num_layers = len(model.model.layers)
     info = detect_model_info(model)
 
+    # Auto-detect whether to stream based on model size vs available RAM
+    if stream_experts == "auto":
+        available_gb = free_gb()
+        model_gb = estimate_model_size_gb(model)
+        # Stream if model exceeds 80% of available memory
+        stream_experts = model_gb > available_gb * 0.8
+        if verbose:
+            print(f"  Model size: ~{model_gb:.0f}GB, available: {available_gb:.0f}GB"
+                  f" → {'streaming' if stream_experts else 'native GPU'}")
+
     # Set up SSD-tiered KV cache (hot RAM + cold SSD)
     tiered_kv = TieredKVCacheWrapper(num_layers, hot_max_gb=kv_hot_gb,
                                       ssd_max_gb=kv_ssd_gb)
 
     # Set up expert cache based on eviction policy
     expert_cache = None
+    policy_name = "N/A"
     if stream_experts:
         if eviction_policy == "belady":
             expert_cache = BeladyExpertCache(
@@ -896,7 +929,9 @@ def main():
     p.add_argument("--prompt", default="The capital of France is")
     p.add_argument("--max-tokens", type=int, default=10)
     p.add_argument("--no-stream", action="store_true",
-                   help="Disable expert streaming (use native MoE forward)")
+                   help="Force native GPU MoE (disable expert streaming)")
+    p.add_argument("--force-stream", action="store_true",
+                   help="Force CPU expert streaming (even if model fits in RAM)")
     p.add_argument("--lazy", action="store_true", default=True,
                    help="Use lazy loading (default: True)")
     p.add_argument("--no-lazy", dest="lazy", action="store_false")
@@ -919,7 +954,12 @@ def main():
                    help="KV cache SSD tier budget in GB (default: 50.0)")
     args = p.parse_args()
 
-    stream = not args.no_stream
+    if args.no_stream:
+        stream = False
+    elif args.force_stream:
+        stream = True
+    else:
+        stream = "auto"  # auto-detect based on model size vs RAM
 
     print("=" * 60)
     print("  ExpertFlow — Dynamic Expert Streaming Engine")
