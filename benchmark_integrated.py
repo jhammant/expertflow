@@ -25,9 +25,43 @@ Output: JSON file with per-turn and aggregate statistics.
 
 import argparse
 import json
+import os
 import sys
 import time
 import numpy as np
+
+__version__ = "0.1.0"
+
+
+def _positive_int(name):
+    """Return an argparse type checker that requires a positive integer."""
+    def check(value):
+        try:
+            ivalue = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--{name} must be an integer, got: {value!r}"
+            )
+        if ivalue <= 0:
+            raise argparse.ArgumentTypeError(
+                f"--{name} must be > 0, got {ivalue}"
+            )
+        return ivalue
+    return check
+
+
+def _output_path(value):
+    """Validate that the output path is writable."""
+    directory = os.path.dirname(os.path.abspath(value))
+    if not os.path.isdir(directory):
+        raise argparse.ArgumentTypeError(
+            f"--output directory does not exist: {directory}"
+        )
+    if os.path.exists(value) and not os.access(value, os.W_OK):
+        raise argparse.ArgumentTypeError(
+            f"--output file exists but is not writable: {value}"
+        )
+    return value
 
 from ef_integrated_engine import (
     ExpertFlowEngine,
@@ -268,20 +302,40 @@ def run_eviction_policy_comparison(config: ModelConfig, n_turns: int = 3,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ExpertFlow integrated benchmark"
+        description="ExpertFlow integrated benchmark — simulates MoE inference caching",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python benchmark_integrated.py --model small --turns 3
+  python benchmark_integrated.py --model deepseek --turns 5 --output results.json
+  python benchmark_integrated.py --model small --compare-policies
+""",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--model", choices=["deepseek", "mixtral", "small"],
         default="small",
         help="Model config to simulate (default: small for quick test)"
     )
-    parser.add_argument("--turns", type=int, default=5, help="Conversation turns")
-    parser.add_argument("--prompt-tokens", type=int, default=50, help="Prompt tokens per turn")
-    parser.add_argument("--response-tokens", type=int, default=100, help="Response tokens per turn")
+    parser.add_argument(
+        "--turns", type=_positive_int("turns"), default=5,
+        help="Number of conversation turns (default: 5)",
+    )
+    parser.add_argument(
+        "--prompt-tokens", type=_positive_int("prompt-tokens"), default=50,
+        help="Prompt tokens per turn (default: 50)",
+    )
+    parser.add_argument(
+        "--response-tokens", type=_positive_int("response-tokens"), default=100,
+        help="Response tokens to generate per turn (default: 100)",
+    )
     parser.add_argument("--compare-policies", action="store_true",
-                        help="Compare all eviction policies")
-    parser.add_argument("--output", type=str, default=None, help="Output JSON file")
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
+                        help="Compare all eviction policies side-by-side")
+    parser.add_argument(
+        "--output", type=_output_path, default=None,
+        help="Write JSON results to this file (default: auto-named with timestamp)",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
     args = parser.parse_args()
 
     configs = {
