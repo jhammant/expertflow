@@ -463,12 +463,14 @@ class ExpertMmapLoader:
             abs_offset = file_info.data_offset + tinfo.offset
             expert_bytes = tinfo.total_bytes // self.n_experts
 
+            # GGML stacked tensors: shape = (cols, rows, n_experts)
+            # Expert slice: shape = (cols, rows) = shape[:2]
             if len(tinfo.shape) == 3:
-                expert_shape = (tinfo.shape[1], tinfo.shape[2])
+                expert_shape = tinfo.shape[:2]   # (cols, rows) — n_experts in dim 2
             elif len(tinfo.shape) == 2:
-                expert_shape = (tinfo.shape[1],)
+                expert_shape = tinfo.shape[:1]
             else:
-                expert_shape = tinfo.shape[1:]
+                expert_shape = tinfo.shape[:len(tinfo.shape) - 1]
 
             self._expert_layout[(layer_idx, proj)] = (
                 tinfo.file_idx, abs_offset, expert_bytes, tinfo.dtype, expert_shape
@@ -576,6 +578,8 @@ class ExpertMmapLoader:
             arr = np.frombuffer(raw, dtype=np.uint8)
             if dtype == GGML_TYPE_Q2_K:
                 results[proj] = dequant_q2_k_fast(arr, shape)
+            elif dtype == GGML_TYPE_Q3_K:
+                results[proj] = dequant_q3_k_fast(arr, shape)
             elif dtype == GGML_TYPE_Q4_K:
                 results[proj] = dequant_q4_k_fast(arr, shape)
             elif dtype == GGML_TYPE_F16:
@@ -618,11 +622,17 @@ class ExpertMmapLoader:
                     abs_offset = file_info.data_offset + tinfo.offset
                     mm = self._mmaps[tinfo.file_idx]
                     raw = bytes(mm[abs_offset:abs_offset + tinfo.total_bytes])
+                    arr = np.frombuffer(raw, dtype=np.uint8)
                     if tinfo.dtype == GGML_TYPE_Q2_K:
-                        results[proj] = dequant_q2_k_fast(
-                            np.frombuffer(raw, dtype=np.uint8), tinfo.shape)
+                        results[proj] = dequant_q2_k_fast(arr, tinfo.shape)
+                    elif tinfo.dtype == GGML_TYPE_Q3_K:
+                        results[proj] = dequant_q3_k_fast(arr, tinfo.shape)
+                    elif tinfo.dtype == GGML_TYPE_Q4_K:
+                        results[proj] = dequant_q4_k_fast(arr, tinfo.shape)
                     elif tinfo.dtype == GGML_TYPE_F16:
-                        results[proj] = np.frombuffer(raw, dtype=np.float16).reshape(tinfo.shape)
+                        results[proj] = arr.view(np.float16).reshape(tinfo.shape)
+                    elif tinfo.dtype == GGML_TYPE_F32:
+                        results[proj] = arr.view(np.float32).reshape(tinfo.shape).astype(np.float16)
                     else:
                         results[proj] = _dequant_generic(raw, tinfo.dtype, tinfo.shape)
                     break
@@ -701,6 +711,64 @@ def dequant_q4_k_fast(data, shape):
     dm_exp = dmin_vals[:, None]
 
     result = d_exp * sc_exp * quants - dm_exp * mn_exp
+    return result.reshape(shape).astype(np.float16)
+
+
+def dequant_q3_k_fast(data, shape):
+    """Vectorized Q3_K dequantization to float16.
+
+    Q3_K block layout (110 bytes for 256 elements, QK_K=256):
+      - hmask[32]: uint8 — 1 high bit per quant (256 bits total)
+      - qs[64]:    uint8 — 2 low bits per quant (4 per byte)
+      - scales[12]: uint8 — 16 × 6-bit signed scales, bit-packed
+      - d:         float16 — super-block scale
+
+    Scale packing (ABCD = lower 4 bits, EFGH = upper 2 bits):
+      bytes 0..7:  IIII·AAAA  (lower nibble = low 4 bits of scales 0..7)
+                   upper nibble = low 4 bits of scales 8..15
+      bytes 8..11: MMII·EEAA  (bits [1:0] = high 2 bits of scales 0/4/8/12, etc.)
+    """
+    n_elements = 1
+    for d in shape:
+        n_elements *= d
+    n_blocks = n_elements // QK_K
+    block_bytes = 110
+
+    blocks = np.frombuffer(data[:n_blocks * block_bytes], dtype=np.uint8).reshape(n_blocks, block_bytes)
+
+    hmask  = blocks[:, :32]          # (n_blocks, 32)
+    qs     = blocks[:, 32:96]        # (n_blocks, 64)
+    scales = blocks[:, 96:108]       # (n_blocks, 12)
+    d_raw  = blocks[:, 108:110]      # (n_blocks, 2)
+    d = np.frombuffer(d_raw.tobytes(), dtype=np.float16).reshape(n_blocks).astype(np.float32)
+
+    # Unpack 6-bit scales from 12 bytes into 16 signed scale values
+    # Bit pattern (see gguf/quants.py Q3_K reference):
+    #   bytes 0..7: lower nibble = sc[0..7] low 4 bits, upper nibble = sc[8..15] low 4 bits
+    #   bytes 8..11: pairs of 2-bit high parts for sc[0..15]
+    lscales = scales[:, :8].reshape(n_blocks, 1, 8) >> np.array([0, 4], dtype=np.uint8).reshape(1, 2, 1)
+    lscales = lscales.reshape(n_blocks, 16)
+    hscales = scales[:, 8:].reshape(n_blocks, 1, 4) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape(1, 4, 1)
+    hscales = hscales.reshape(n_blocks, 16)
+    sc = ((lscales & np.uint8(0x0F)) | ((hscales & np.uint8(0x03)) << np.uint8(4))).astype(np.int8)
+    sc = (sc.astype(np.float32) - 32.0)  # 6-bit signed offset: subtract 32
+
+    dl = (d[:, None] * sc)  # (n_blocks, 16)
+
+    # Unpack 3-bit quants: low 2 bits from qs, high 1 bit from hmask
+    # qs[64] → 4 values per byte (2 bits each) → shape (n_blocks, 16, 16)
+    ql = qs.reshape(n_blocks, -1, 1, 32) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape(1, 1, 4, 1)
+    ql = ql.reshape(n_blocks, 16, QK_K // 16) & np.uint8(3)
+
+    # hmask[32] → 1 bit per element → shape (n_blocks, 16, 16)
+    qh = hmask.reshape(n_blocks, -1, 1, 32) >> np.arange(8, dtype=np.uint8).reshape(1, 1, 8, 1)
+    qh = (qh.reshape(n_blocks, 16, QK_K // 16) & np.uint8(1)) ^ np.uint8(1)
+
+    # Combine: q = ql - (qh << 2), range: -4..3
+    q = ql.astype(np.int8) - (qh << np.uint8(2)).astype(np.int8)
+    q = q.astype(np.float32)
+
+    result = (dl[:, :, None] * q).reshape(n_blocks, QK_K)
     return result.reshape(shape).astype(np.float16)
 
 
