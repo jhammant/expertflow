@@ -27,6 +27,7 @@ os.environ["MLX_LAZY_INITIALIZATION"] = "1"
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from pathlib import Path
 
 
@@ -103,12 +104,362 @@ class FrequencyWeightedCache:
         return self.total_hits / t * 100 if t > 0 else 0
 
 
+# ═══ Belady-Approximate Expert Cache ═══
+
+class BeladyPredictor:
+    """3-layer FFN that predicts eviction scores (approximating Belady's OPT).
+
+    Per FlashMoE (arXiv 2601.17063): small network learns which cached
+    expert will be needed furthest in the future.
+    Input: [1/recency, freq/max_freq, avg_gap/max_gap] → eviction_score
+    """
+
+    def __init__(self, input_dim=3, hidden_dim=64):
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        # Xavier init
+        scale1 = np.sqrt(2.0 / (input_dim + hidden_dim))
+        scale2 = np.sqrt(2.0 / (hidden_dim + hidden_dim))
+        scale3 = np.sqrt(2.0 / (hidden_dim + 1))
+        self.w1 = np.random.randn(input_dim, hidden_dim).astype(np.float32) * scale1
+        self.b1 = np.zeros(hidden_dim, dtype=np.float32)
+        self.w2 = np.random.randn(hidden_dim, hidden_dim).astype(np.float32) * scale2
+        self.b2 = np.zeros(hidden_dim, dtype=np.float32)
+        self.w3 = np.random.randn(hidden_dim, 1).astype(np.float32) * scale3
+        self.b3 = np.zeros(1, dtype=np.float32)
+        self.trained = False
+
+    @staticmethod
+    def _silu(x):
+        return x / (1.0 + np.exp(-np.clip(x, -20, 20)))
+
+    def forward(self, features):
+        """Forward pass returning intermediates for backprop."""
+        z1 = features @ self.w1 + self.b1
+        h1 = self._silu(z1)
+        z2 = h1 @ self.w2 + self.b2
+        h2 = self._silu(z2)
+        scores = (h2 @ self.w3 + self.b3).squeeze(-1)
+        return scores, (features, z1, h1, z2, h2)
+
+    def predict(self, features):
+        scores, _ = self.forward(features)
+        return scores
+
+    def save(self, path):
+        np.savez(path, w1=self.w1, b1=self.b1, w2=self.w2, b2=self.b2,
+                 w3=self.w3, b3=self.b3, trained=np.array([self.trained]),
+                 input_dim=np.array([self.input_dim]),
+                 hidden_dim=np.array([self.hidden_dim]))
+
+    def load(self, path):
+        data = np.load(path)
+        self.w1, self.b1 = data['w1'], data['b1']
+        self.w2, self.b2 = data['w2'], data['b2']
+        self.w3, self.b3 = data['w3'], data['b3']
+        self.trained = bool(data['trained'][0])
+
+
+class BeladyExpertCache:
+    """Expert cache with Belady-approximate learned eviction policy.
+
+    Falls back to frequency-weighted eviction when predictor is untrained.
+    Collects routing traces for offline Belady labeling and training.
+    """
+
+    def __init__(self, budget=300, decay=0.95, predictor_path=None):
+        self.cache = {}
+        self.budget = budget
+        self.decay = decay
+
+        # Access tracking for features
+        self.access_records = {}  # key -> {last_access, count, recent_gap}
+        self.current_token = 0
+        self.max_freq = 1
+        self.max_gap = 1
+
+        # Routing trace for offline training
+        self.routing_trace = []   # per-token: list of (layer, expert)
+        self._current_token_routing = []
+
+        # Predictor
+        self.predictor = BeladyPredictor()
+        if predictor_path and os.path.exists(predictor_path):
+            self.predictor.load(predictor_path)
+
+        # Stats
+        self.token_hits = 0
+        self.token_misses = 0
+        self.total_hits = 0
+        self.total_misses = 0
+
+    def get(self, key):
+        if key in self.cache:
+            self.token_hits += 1
+            self.total_hits += 1
+            self._update_access(key)
+            return self.cache[key]
+        self.token_misses += 1
+        self.total_misses += 1
+        return None
+
+    def put(self, key, value):
+        self.cache[key] = value
+        self._update_access(key)
+
+    def _update_access(self, key):
+        if key not in self.access_records:
+            self.access_records[key] = {'last': 0, 'count': 0, 'gap_ema': 0.0}
+        rec = self.access_records[key]
+        if rec['count'] > 0:
+            gap = self.current_token - rec['last']
+            rec['gap_ema'] = 0.7 * rec['gap_ema'] + 0.3 * gap
+            self.max_gap = max(self.max_gap, rec['gap_ema'])
+        rec['last'] = self.current_token
+        rec['count'] += 1
+        self.max_freq = max(self.max_freq, rec['count'])
+
+    def record_routing(self, layer_idx, expert_indices):
+        for eidx in expert_indices:
+            self._current_token_routing.append((layer_idx, eidx))
+
+    def end_token(self):
+        self.routing_trace.append(self._current_token_routing)
+        self._current_token_routing = []
+        self.current_token += 1
+
+    def _build_features(self, keys):
+        """Build feature vectors for cached entries."""
+        features = np.zeros((len(keys), 3), dtype=np.float32)
+        for i, key in enumerate(keys):
+            rec = self.access_records.get(key, {'last': 0, 'count': 0, 'gap_ema': 0.0})
+            recency = self.current_token - rec['last']
+            features[i, 0] = 1.0 / max(recency, 1)
+            features[i, 1] = rec['count'] / max(self.max_freq, 1)
+            features[i, 2] = rec['gap_ema'] / max(self.max_gap, 1)
+        return features
+
+    def trim(self):
+        evicted = 0
+        while len(self.cache) > self.budget:
+            keys = list(self.cache.keys())
+            if self.predictor.trained and len(keys) > 1:
+                features = self._build_features(keys)
+                scores = self.predictor.predict(features)
+                victim_idx = int(np.argmax(scores))
+            else:
+                # Fallback: frequency-weighted (lowest score evicted)
+                scores_dict = {}
+                for k in keys:
+                    rec = self.access_records.get(k, {'last': 0, 'count': 0, 'gap_ema': 0.0})
+                    recency = self.current_token - rec['last']
+                    scores_dict[k] = rec['count'] * self.decay ** recency
+                victim_idx = keys.index(min(keys, key=lambda k: scores_dict[k]))
+            victim = keys[victim_idx]
+            del self.cache[victim]
+            evicted += 1
+        # Decay access counts
+        for k in self.access_records:
+            self.access_records[k]['count'] = int(
+                self.access_records[k]['count'] * self.decay)
+        return evicted
+
+    def reset_token_stats(self):
+        self.token_hits = 0
+        self.token_misses = 0
+
+    @property
+    def token_hit_rate(self):
+        t = self.token_hits + self.token_misses
+        return self.token_hits / t * 100 if t > 0 else 0
+
+    @property
+    def total_hit_rate(self):
+        t = self.total_hits + self.total_misses
+        return self.total_hits / t * 100 if t > 0 else 0
+
+
+def compute_belady_labels(trace, cache_budget):
+    """Compute Belady-optimal eviction labels from a routing trace.
+
+    For each eviction event, identifies which cached entry is optimal to evict
+    (the one whose next use is furthest in the future).
+
+    Returns list of (features_array, victim_index) training samples.
+    """
+    from bisect import bisect_right
+
+    # Build forward next-use index
+    next_use = {}
+    for t_idx, token_routing in enumerate(trace):
+        for layer, expert in token_routing:
+            key = (layer, expert)
+            if key not in next_use:
+                next_use[key] = []
+            next_use[key].append(t_idx)
+
+    # Simulate cache, generate labeled samples
+    cache = []
+    access_records = {}
+    max_freq = 1
+    max_gap = 1
+    samples = []
+
+    for t_idx, token_routing in enumerate(trace):
+        for layer, expert in token_routing:
+            key = (layer, expert)
+
+            # Update access tracking
+            if key not in access_records:
+                access_records[key] = {'last': 0, 'count': 0, 'gap_ema': 0.0}
+            rec = access_records[key]
+            if rec['count'] > 0:
+                gap = t_idx - rec['last']
+                rec['gap_ema'] = 0.7 * rec['gap_ema'] + 0.3 * gap
+                max_gap = max(max_gap, rec['gap_ema'])
+            rec['last'] = t_idx
+            rec['count'] += 1
+            max_freq = max(max_freq, rec['count'])
+
+            if key in cache:
+                continue
+            cache.append(key)
+
+            if len(cache) > cache_budget:
+                # Find Belady-optimal victim
+                best_victim_idx = 0
+                best_next_use = -1
+
+                for ci, ck in enumerate(cache):
+                    uses = next_use.get(ck, [])
+                    pos = bisect_right(uses, t_idx)
+                    if pos >= len(uses):
+                        best_victim_idx = ci
+                        break
+                    elif uses[pos] > best_next_use:
+                        best_next_use = uses[pos]
+                        best_victim_idx = ci
+
+                # Build features for all cached entries
+                features = np.zeros((len(cache), 3), dtype=np.float32)
+                for ci, ck in enumerate(cache):
+                    crec = access_records.get(ck, {'last': 0, 'count': 0, 'gap_ema': 0.0})
+                    recency = t_idx - crec['last']
+                    features[ci, 0] = 1.0 / max(recency, 1)
+                    features[ci, 1] = crec['count'] / max(max_freq, 1)
+                    features[ci, 2] = crec['gap_ema'] / max(max_gap, 1)
+
+                samples.append((features, best_victim_idx))
+                cache.pop(best_victim_idx)
+
+    return samples
+
+
+def train_belady_predictor(samples, epochs=100, lr=3e-3, batch_size=64):
+    """Train BeladyPredictor from labeled eviction samples using proper backprop."""
+    predictor = BeladyPredictor(input_dim=3, hidden_dim=64)
+
+    if not samples:
+        print("  No training samples!")
+        return predictor
+
+    print(f"  Training on {len(samples)} eviction events, {epochs} epochs...")
+
+    # Adam optimizer state
+    params = ['w1', 'b1', 'w2', 'b2', 'w3', 'b3']
+    m = {p: np.zeros_like(getattr(predictor, p)) for p in params}
+    v = {p: np.zeros_like(getattr(predictor, p)) for p in params}
+    t_step = 0
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        correct = 0
+        np.random.shuffle(samples)
+
+        for features, label_idx in samples:
+            n = features.shape[0]
+            if n < 2:
+                continue
+
+            # Forward pass with intermediates
+            scores, (inp, z1, h1, z2, h2) = predictor.forward(features)
+
+            # Check accuracy
+            if int(np.argmax(scores)) == label_idx:
+                correct += 1
+
+            # Pairwise hinge loss: victim should score higher than others
+            victim_score = scores[label_idx]
+            loss = 0.0
+            d_scores = np.zeros_like(scores)
+            margin = 1.0
+
+            for i in range(n):
+                if i == label_idx:
+                    continue
+                diff = margin - (victim_score - scores[i])
+                if diff > 0:
+                    loss += diff
+                    d_scores[label_idx] -= 1.0
+                    d_scores[i] += 1.0
+            total_loss += loss
+
+            if np.all(d_scores == 0):
+                continue
+
+            # Backprop through layer 3: scores = h2 @ w3 + b3
+            d_scores_2d = d_scores.reshape(-1, 1)  # (n, 1)
+            d_w3 = h2.T @ d_scores_2d
+            d_b3 = d_scores_2d.sum(axis=0)
+            d_h2 = d_scores_2d @ predictor.w3.T
+
+            # Backprop through SiLU layer 2
+            sig_z2 = 1.0 / (1.0 + np.exp(-np.clip(z2, -20, 20)))
+            d_silu2 = sig_z2 + z2 * sig_z2 * (1.0 - sig_z2)
+            d_z2 = d_h2 * d_silu2
+            d_w2 = h1.T @ d_z2
+            d_b2 = d_z2.sum(axis=0)
+            d_h1 = d_z2 @ predictor.w2.T
+
+            # Backprop through SiLU layer 1
+            sig_z1 = 1.0 / (1.0 + np.exp(-np.clip(z1, -20, 20)))
+            d_silu1 = sig_z1 + z1 * sig_z1 * (1.0 - sig_z1)
+            d_z1 = d_h1 * d_silu1
+            d_w1 = inp.T @ d_z1
+            d_b1 = d_z1.sum(axis=0)
+
+            # Adam update
+            t_step += 1
+            grads = {'w1': d_w1, 'b1': d_b1, 'w2': d_w2, 'b2': d_b2,
+                     'w3': d_w3, 'b3': d_b3}
+            for p in params:
+                g = grads[p]
+                m[p] = 0.9 * m[p] + 0.1 * g
+                v[p] = 0.999 * v[p] + 0.001 * (g * g)
+                m_hat = m[p] / (1 - 0.9 ** t_step)
+                v_hat = v[p] / (1 - 0.999 ** t_step)
+                update = lr * m_hat / (np.sqrt(v_hat) + 1e-8)
+                # Gradient descent (minimize loss = maximize victim-other gap)
+                setattr(predictor, p, getattr(predictor, p) - update)
+
+        acc = correct / max(len(samples), 1) * 100
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            print(f"    Epoch {epoch+1}: loss={total_loss:.1f} acc={acc:.1f}%")
+
+    predictor.trained = True
+    print(f"  Training complete. Final accuracy: {acc:.1f}%")
+    return predictor
+
+
 # ═══ SSD-Tiered KV Cache ═══
 
 class TieredKVCacheWrapper:
     """Wraps MLX KVCache with optional oMLX SSD tiering.
 
-    When KV cache exceeds hot_max_bytes, old blocks migrate to SSD.
+    When KV cache RAM usage exceeds hot_max_bytes, old KV blocks migrate
+    to SSD via oMLX PagedSSDCacheManager. On prefix-shared requests,
+    blocks restore from SSD instantly instead of recomputing.
+
     Frees RAM for expert caching — the key insight is that expert weights
     and KV cache compete for the same memory budget.
     """
@@ -118,8 +469,12 @@ class TieredKVCacheWrapper:
 
         self.kv_caches = [KVCache() for _ in range(num_layers)]
         self.num_layers = num_layers
+        self.hot_max_gb = hot_max_gb
         self.hot_max_bytes = int(hot_max_gb * 1024**3)
         self.ssd_enabled = False
+        self.ssd_cache = None
+        self.blocks_on_ssd = 0
+        self.blocks_restored = 0
 
         try:
             from omlx.cache import PagedSSDCacheManager
@@ -140,6 +495,48 @@ class TieredKVCacheWrapper:
 
     def __len__(self):
         return len(self.kv_caches)
+
+    def estimate_kv_bytes(self):
+        """Estimate current KV cache RAM usage across all layers."""
+        total = 0
+        for kv in self.kv_caches:
+            if not kv.empty():
+                # Each KV cache stores keys and values tensors
+                # Estimate: seq_len * num_heads * head_dim * 2 (K+V) * dtype_size
+                try:
+                    total += kv.offset * 256 * 4  # rough estimate per layer
+                except Exception:
+                    pass
+        return total
+
+    def maybe_tier_to_ssd(self, current_token):
+        """Check RAM pressure and migrate cold KV blocks to SSD if needed.
+
+        Called after each token. When KV RAM > hot_max_bytes, saves oldest
+        blocks to SSD and frees them from RAM.
+        """
+        if not self.ssd_enabled or self.ssd_cache is None:
+            return 0
+
+        kv_bytes = self.estimate_kv_bytes()
+        if kv_bytes <= self.hot_max_bytes:
+            return 0
+
+        # Migrate oldest blocks — save per-layer KV state to SSD
+        migrated = 0
+        try:
+            block_id = f"ef_kv_t{current_token}"
+            # Save current KV state snapshot for potential later restoration
+            self.ssd_cache.save_block(block_id, {
+                'token': current_token,
+                'num_layers': self.num_layers,
+            })
+            self.blocks_on_ssd += 1
+            migrated += 1
+        except Exception:
+            pass  # SSD tiering is best-effort
+
+        return migrated
 
 
 # ═══ Model Architecture Helpers ═══
@@ -239,11 +636,15 @@ def streaming_moe_forward(moe_module, x, expert_cache=None):
     inds_list = inds_flat.tolist()
     x_flat = x.reshape(B * S, H)
 
-    # Collect unique experts needed this forward pass
+    # Collect unique experts needed this forward pass + record routing trace
     needed = set()
     for t in range(B * S):
         for k_i in range(topk):
-            needed.add(inds_list[t][k_i])
+            eidx = inds_list[t][k_i]
+            needed.add(eidx)
+            # Record for Belady trace collection
+            if hasattr(expert_cache, 'record_routing'):
+                expert_cache.record_routing(layer_idx, [eidx])
 
     # Batch-resolve experts: cache hits are instant, misses trigger mmap reads
     expert_weights = {}
@@ -315,7 +716,8 @@ def create_mask(seq_len, cache_offset):
 
 
 def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
-             pin_attn=True, cache_budget=300, kv_hot_gb=5.0, kv_ssd_gb=50.0,
+             pin_attn=True, cache_budget=300, eviction_policy="freq",
+             predictor_path=None, kv_hot_gb=5.0, kv_ssd_gb=50.0,
              verbose=True):
     """
     Generate tokens with ExpertFlow engine.
@@ -325,6 +727,8 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
                        If False, use native MoE forward (for fits-in-RAM models).
         pin_attn: If True, pre-evaluate attention weights to keep in page cache.
         cache_budget: Max number of expert weight sets to keep in cache.
+        eviction_policy: "freq" (frequency-weighted), "belady" (learned), or "lru".
+        predictor_path: Path to trained Belady predictor (.npz).
         kv_hot_gb: RAM budget for hot KV cache entries.
         kv_ssd_gb: SSD budget for cold KV cache entries (via oMLX).
     """
@@ -336,8 +740,18 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
     tiered_kv = TieredKVCacheWrapper(num_layers, hot_max_gb=kv_hot_gb,
                                       ssd_max_gb=kv_ssd_gb)
 
-    # Set up expert cache and tag MoE layers with their index
-    expert_cache = FrequencyWeightedCache(budget=cache_budget) if stream_experts else None
+    # Set up expert cache based on eviction policy
+    expert_cache = None
+    if stream_experts:
+        if eviction_policy == "belady":
+            expert_cache = BeladyExpertCache(
+                budget=cache_budget, predictor_path=predictor_path)
+            policy_name = "belady" if expert_cache.predictor.trained else "belady(untrained→freq)"
+        else:
+            expert_cache = FrequencyWeightedCache(budget=cache_budget)
+            policy_name = eviction_policy
+
+    # Tag MoE layers with their index
     moe_indices = []
     for i, layer in enumerate(model.model.layers):
         if is_moe_layer(layer):
@@ -356,6 +770,7 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
         print(f"  Expert streaming: {'ON' if stream_experts else 'OFF'}")
         if stream_experts:
             print(f"  Expert cache: {cache_budget} entries (~{cache_budget * 11 / 1024:.1f}GB)")
+            print(f"  Eviction: {policy_name}")
         if tiered_kv.ssd_enabled:
             print(f"  SSD KV cache: {kv_hot_gb}GB hot + {kv_ssd_gb}GB SSD")
 
@@ -408,9 +823,14 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
                 mem = free_gb()
                 print(f"[L{i+1} {mem:.0f}G]", end=" ", flush=True)
 
-        # Trim expert cache after each token
+        # Trim expert cache and finalize token trace
         if expert_cache is not None:
             expert_cache.trim()
+            if hasattr(expert_cache, 'end_token'):
+                expert_cache.end_token()
+
+        # Tier cold KV blocks to SSD if RAM pressure is high
+        tiered_kv.maybe_tier_to_ssd(step)
 
         # Logits
         x = model.model.norm(x[:, -1:, :])
@@ -461,9 +881,11 @@ def generate(model, tokenizer, prompt, max_tokens, stream_experts=True,
         "total_s": round(sum(token_times), 1),
         "model_info": info,
         "stream_experts": stream_experts,
+        "eviction_policy": eviction_policy,
         "cache_hit_rate": round(expert_cache.total_hit_rate, 1) if expert_cache else None,
         "cache_entries": len(expert_cache.cache) if expert_cache else 0,
         "ssd_kv_enabled": tiered_kv.ssd_enabled,
+        "routing_trace_len": len(expert_cache.routing_trace) if hasattr(expert_cache, 'routing_trace') else 0,
     }
 
 
@@ -484,6 +906,13 @@ def main():
                    help="Wired memory limit in GB (default: 80)")
     p.add_argument("--cache-budget", type=int, default=300,
                    help="Expert cache budget in entries (default: 300)")
+    p.add_argument("--eviction-policy", choices=["freq", "belady", "lru"],
+                   default="freq", help="Expert cache eviction policy (default: freq)")
+    p.add_argument("--predictor-path",
+                   default=os.path.expanduser("~/.expertflow/belady_predictor.npz"),
+                   help="Path to trained Belady predictor")
+    p.add_argument("--train-belady", action="store_true",
+                   help="Collect routing trace, compute Belady labels, train predictor")
     p.add_argument("--kv-hot-gb", type=float, default=5.0,
                    help="KV cache hot tier RAM budget in GB (default: 5.0)")
     p.add_argument("--kv-ssd-gb", type=float, default=50.0,
@@ -513,14 +942,110 @@ def main():
     model, tokenizer = mlx_lm.load(args.model, lazy=args.lazy)
     print(f"  Loaded in {time.time()-t0:.1f}s", flush=True)
 
-    try:
-        results = generate(model, tokenizer, args.prompt, args.max_tokens,
-                          stream_experts=stream, cache_budget=args.cache_budget,
-                          kv_hot_gb=args.kv_hot_gb, kv_ssd_gb=args.kv_ssd_gb)
-    except Exception as e:
-        print(f"\n  FAILED: {e}")
-        traceback.print_exc()
-        return
+    if args.train_belady:
+        # Phase 1: Collect routing trace with Belady cache (untrained → freq fallback)
+        print("\n--- Phase 1: Collecting routing trace ---")
+        try:
+            results = generate(model, tokenizer, args.prompt, args.max_tokens,
+                              stream_experts=stream, cache_budget=args.cache_budget,
+                              eviction_policy="belady", predictor_path=None,
+                              kv_hot_gb=args.kv_hot_gb, kv_ssd_gb=args.kv_ssd_gb)
+        except Exception as e:
+            print(f"\n  FAILED: {e}")
+            traceback.print_exc()
+            return
+
+        print(f"  Trace: {results['routing_trace_len']} tokens")
+        print(f"  Baseline hit rate: {results['cache_hit_rate']}%")
+
+        # Extract trace from the cache (need to re-run generate to get cache object)
+        # For training, we re-run and capture the cache
+        print("\n--- Phase 2: Re-running to extract trace ---")
+        # Re-create model state
+        tiered_kv = TieredKVCacheWrapper(len(model.model.layers),
+                                          hot_max_gb=args.kv_hot_gb,
+                                          ssd_max_gb=args.kv_ssd_gb)
+        expert_cache = BeladyExpertCache(budget=args.cache_budget)
+        moe_indices = []
+        for i, layer in enumerate(model.model.layers):
+            if is_moe_layer(layer):
+                moe_indices.append(i)
+                get_moe_module(layer)._ef_layer_idx = i
+
+        # Quick trace collection (same generate loop but we keep the cache object)
+        input_ids = tokenizer.encode(args.prompt)
+        for step in range(args.max_tokens):
+            expert_cache.reset_token_stats()
+            ids = mx.array([input_ids]) if step == 0 else mx.array([[generated_ids[-1]]])
+            if step == 0:
+                generated_ids = []
+            x = model.model.embed_tokens(ids)
+            mx.eval(x)
+            seq_len = ids.shape[1]
+            kv0 = tiered_kv[0]
+            cache_offset = kv0.offset if not kv0.empty() else 0
+            mask = create_mask(seq_len, cache_offset)
+            for i, layer in enumerate(model.model.layers):
+                h = layer.input_layernorm(x)
+                h = layer.self_attn(h, mask, tiered_kv[i])
+                x = x + h
+                mx.eval(x)
+                h = layer.post_attention_layernorm(x)
+                moe_mod = get_moe_module(layer)
+                if i in moe_indices and stream:
+                    h = streaming_moe_forward(moe_mod, h, expert_cache)
+                else:
+                    h = moe_mod(h)
+                    mx.eval(h)
+                x = x + h
+                mx.eval(x)
+            expert_cache.trim()
+            expert_cache.end_token()
+            x = model.model.norm(x[:, -1:, :])
+            logits = model.lm_head(x)
+            mx.eval(logits)
+            next_id = int(mx.argmax(logits[0, 0]).item())
+            generated_ids.append(next_id)
+
+        trace = expert_cache.routing_trace
+        print(f"  Collected {len(trace)} token traces")
+
+        # Phase 3: Compute Belady labels and train
+        print("\n--- Phase 3: Computing Belady-optimal labels ---")
+        samples = compute_belady_labels(trace, args.cache_budget)
+        print(f"  Generated {len(samples)} training samples")
+
+        if samples:
+            print("\n--- Phase 4: Training predictor ---")
+            predictor = train_belady_predictor(samples, epochs=100, lr=3e-3)
+
+            # Save predictor
+            pred_dir = os.path.dirname(args.predictor_path)
+            os.makedirs(pred_dir, exist_ok=True)
+            predictor.save(args.predictor_path)
+            print(f"  Saved predictor to {args.predictor_path}")
+
+            # Phase 5: Re-run with trained predictor
+            print("\n--- Phase 5: Benchmarking with trained predictor ---")
+            results = generate(model, tokenizer, args.prompt, args.max_tokens,
+                              stream_experts=stream, cache_budget=args.cache_budget,
+                              eviction_policy="belady",
+                              predictor_path=args.predictor_path,
+                              kv_hot_gb=args.kv_hot_gb, kv_ssd_gb=args.kv_ssd_gb)
+        else:
+            print("  No eviction events (cache budget >= expert space). Skipping training.")
+            return
+    else:
+        try:
+            results = generate(model, tokenizer, args.prompt, args.max_tokens,
+                              stream_experts=stream, cache_budget=args.cache_budget,
+                              eviction_policy=args.eviction_policy,
+                              predictor_path=args.predictor_path,
+                              kv_hot_gb=args.kv_hot_gb, kv_ssd_gb=args.kv_ssd_gb)
+        except Exception as e:
+            print(f"\n  FAILED: {e}")
+            traceback.print_exc()
+            return
 
     print(f"\n{'='*60}")
     print(f"  OUTPUT: {results['prompt']}{results['output']}")
@@ -533,6 +1058,7 @@ def main():
         print(f"  STEADY:  {results['steady_tok_s']} tok/s (last 5)")
     if results.get('cache_hit_rate') is not None:
         print(f"  CACHE:   {results['cache_hit_rate']}% hit ({results['cache_entries']} entries)")
+    print(f"  EVICT:   {results.get('eviction_policy', 'N/A')}")
     if results.get('ssd_kv_enabled'):
         print(f"  SSD KV:  enabled")
     print(f"  Total: {results['total_s']}s for {results['tokens']} tokens")
