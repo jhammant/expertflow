@@ -34,6 +34,7 @@ class TestExpertFlowEngineToken:
         assert "token_idx" in result
         assert "expert_hit_rate" in result
         assert "kv_ram_mb" in result
+        assert "kv_hit_rate" in result
         assert result["token_idx"] == 1
 
     def test_prefill_processes_multiple_tokens(self):
@@ -165,7 +166,24 @@ class TestBenchmarkRebalancing:
         assert "tokens_generated" in stats
         assert "expert_cache" in stats
         assert "kv_cache" in stats
+        assert "cache_hit_rate" in stats["kv_cache"]
         assert stats["tokens_generated"] == 11
+
+    def test_benchmark_reports_kv_cache_metrics(self):
+        from benchmark_integrated import run_benchmark
+
+        result = run_benchmark(
+            config=FAST_CONFIG,
+            n_turns=1,
+            prompt_tokens=4,
+            response_tokens=4,
+            verbose=False,
+        )
+
+        aggregate = result["aggregate"]
+        assert "final_kv_hit_rate" in aggregate
+        assert "total_kv_page_ins" in aggregate
+        assert "total_kv_page_outs" in aggregate
 
 
 class TestEvictionPolicyComparison:

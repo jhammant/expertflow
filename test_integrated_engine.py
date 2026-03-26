@@ -285,6 +285,7 @@ class TestExpertFlowEngine:
         assert result["is_prefill"] is False
         assert result["time_s"] > 0
         assert result["kv_seq_len"] == 1
+        assert "kv_hit_rate" in result
         assert engine.tokens_generated == 1
 
     def test_generate_prefill(self):
@@ -330,6 +331,7 @@ class TestExpertFlowEngine:
             engine.generate_token()
 
         assert engine.expert_cache.total_hit_rate > 0  # some hits
+        assert engine.kv_cache.cache_hits > 0
 
     def test_rebalance_budgets(self):
         engine = ExpertFlowEngine(config=FAST_CONFIG)
@@ -354,6 +356,7 @@ class TestExpertFlowEngine:
         assert result["decode_tok_s"] > 0
         assert result["kv_seq_len"] > 0
         assert "expert_cache_hit_rate" in result
+        assert "kv_hit_rate" in result
 
     def test_multi_turn_context_grows(self):
         engine = ExpertFlowEngine(config=FAST_CONFIG)
@@ -481,6 +484,38 @@ class TestBenchmarkIntegration:
         for policy, stats in comparison.items():
             assert "avg_decode_tok_s" in stats
             assert "avg_expert_hit_rate" in stats
+            assert "final_kv_hit_rate" in stats
+
+    def test_kv_reads_drive_cache_hits(self):
+        engine = ExpertFlowEngine(config=FAST_CONFIG)
+        engine.generate_token(is_prefill=True, prefill_tokens=8)
+        engine.generate_token()
+
+        assert engine.kv_cache.cache_hits > 0
+        assert engine.kv_cache.total_seq_len == 9
+
+    def test_kv_ssd_tiering_surfaces_page_io(self, tmp_path):
+        config = ModelConfig(
+            name="KV-Tiering-Test",
+            n_layers=2, first_moe_layer=0, n_experts=4, n_active_experts=1,
+            num_kv_heads=2, head_dim=8,
+            expert_rows=8, expert_cols=4,
+            total_ram_gb=1, attn_budget_gb=0, os_overhead_gb=0,
+            cold_load_ms=0, warm_load_ms=0,
+            kv_block_size=4,
+        )
+        engine = ExpertFlowEngine(
+            config=config,
+            initial_kv_fraction=0.001,
+            kv_spill_directory=str(tmp_path),
+        )
+        engine.kv_cache.kv_budget_bytes = 128
+
+        engine.generate_token(is_prefill=True, prefill_tokens=12)
+        engine.generate_token()
+
+        assert engine.kv_cache.total_page_outs > 0
+        assert engine.kv_cache.total_page_ins > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════

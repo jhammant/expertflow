@@ -28,10 +28,13 @@ RAM, which can be reclaimed from the expert cache budget (fewer cached
 experts → more cache misses → slower, but necessary for long contexts).
 """
 
+import os
 import time
+import shutil
+import tempfile
 import threading
 import numpy as np
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -46,6 +49,43 @@ class EvictionPolicy(Enum):
     LRU = "lru"
     FREQUENCY_WEIGHTED = "frequency_weighted"
     BELADY_APPROXIMATE = "belady_approximate"
+
+
+class BeladyPredictor:
+    """Exact next-use predictor when a future access trace is available.
+
+    The predictor stores future block accesses as positions in a sequence and
+    returns the block whose next use is furthest away, which is the optimal
+    eviction choice under Belady's algorithm.
+    """
+
+    def __init__(self):
+        self._future_positions: dict[tuple[int, int], deque[int]] = defaultdict(deque)
+        self._cursor = 0
+
+    def prime(self, access_sequence: list[tuple[int, int]]):
+        """Load a fresh future access sequence."""
+        self._future_positions.clear()
+        self._cursor = 0
+        for idx, key in enumerate(access_sequence):
+            self._future_positions[key].append(idx)
+
+    def observe(self, key: tuple[int, int]):
+        """Advance the predictor after a block access is consumed."""
+        positions = self._future_positions.get(key)
+        while positions and positions[0] < self._cursor:
+            positions.popleft()
+        if positions and positions[0] == self._cursor:
+            positions.popleft()
+        self._cursor += 1
+
+    def next_use_distance(self, key: tuple[int, int]) -> float:
+        positions = self._future_positions.get(key)
+        while positions and positions[0] < self._cursor:
+            positions.popleft()
+        if not positions:
+            return float("inf")
+        return float(positions[0] - self._cursor)
 
 
 @dataclass
@@ -78,10 +118,15 @@ class KVBlock:
     pinned: bool = False
     on_disk: bool = False
     disk_path: Optional[str] = None
+    stored_nbytes: int = 0
 
     @property
     def block_size(self) -> int:
         return self.seq_end - self.seq_start
+
+    def __post_init__(self):
+        if self.keys is not None and self.values is not None:
+            self.stored_nbytes = self.keys.nbytes + self.values.nbytes
 
     @property
     def nbytes(self) -> int:
@@ -89,6 +134,12 @@ class KVBlock:
         if self.on_disk or self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+    @property
+    def estimated_nbytes(self) -> int:
+        if self.nbytes > 0:
+            return self.nbytes
+        return self.stored_nbytes
 
     @property
     def block_id(self) -> tuple:
@@ -105,8 +156,10 @@ class KVBlock:
         if self.pinned or self.on_disk or self.keys is None:
             return 0
         freed = self.nbytes
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, keys=self.keys, values=self.values)
         self.disk_path = path
+        self.stored_nbytes = freed
         self.keys = None
         self.values = None
         self.on_disk = True
@@ -116,9 +169,14 @@ class KVBlock:
         """Restore K/V from disk into RAM. Returns bytes loaded."""
         if not self.on_disk or self.disk_path is None:
             return 0
+        if not os.path.exists(self.disk_path):
+            self.on_disk = False
+            self.disk_path = None
+            return 0
         data = np.load(self.disk_path)
         self.keys = data['keys']
         self.values = data['values']
+        self.stored_nbytes = self.keys.nbytes + self.values.nbytes
         self.on_disk = False
         self.touch()
         return self.nbytes
@@ -312,6 +370,9 @@ class PagedKVCache:
 
     def clear(self):
         """Remove all blocks and reset state."""
+        for block in self.blocks.values():
+            if block.disk_path and os.path.exists(block.disk_path):
+                os.remove(block.disk_path)
         self.blocks.clear()
         self.seq_len = 0
 
@@ -363,13 +424,21 @@ class MoEKVCacheManager:
     def __init__(self, n_layers: int, num_kv_heads: int = 8,
                  head_dim: int = 128, block_size: int = 256,
                  kv_budget_bytes: int = 10 * 1024**3,
-                 eviction_policy: EvictionPolicy = EvictionPolicy.LRU):
+                 eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
+                 enable_ssd_tiering: bool = True,
+                 spill_directory: Optional[str] = None):
         self.n_layers = n_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.block_size = block_size
         self.kv_budget_bytes = kv_budget_bytes
         self.eviction_policy = eviction_policy
+        self.enable_ssd_tiering = enable_ssd_tiering
+        self.spill_directory = spill_directory
+        self._owns_spill_directory = False
+        if self.enable_ssd_tiering and self.spill_directory is None:
+            self.spill_directory = tempfile.mkdtemp(prefix="expertflow-kv-")
+            self._owns_spill_directory = True
 
         # Per-layer paged KV caches
         self.layers: list[PagedKVCache] = [
@@ -390,12 +459,15 @@ class MoEKVCacheManager:
 
         # Belady predictor weights (if using Belady-approximate policy)
         self._belady_weights = None
+        self._belady_predictor: Optional[BeladyPredictor] = None
 
         # Stats
         self.total_evictions = 0
         self.total_bytes_evicted = 0
         self.total_page_outs = 0
         self.total_page_ins = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
         self._lock = threading.Lock()
 
     @property
@@ -420,6 +492,15 @@ class MoEKVCacheManager:
         if self.kv_budget_bytes <= 0:
             return 0.0
         return self.total_ram_bytes / self.kv_budget_bytes
+
+    @property
+    def total_on_disk_blocks(self) -> int:
+        return sum(layer.num_on_disk for layer in self.layers)
+
+    @property
+    def cache_hit_rate(self) -> float:
+        total = self.cache_hits + self.cache_misses
+        return self.cache_hits / total if total > 0 else 0.0
 
     def bytes_per_token_all_layers(self) -> int:
         """Bytes consumed per token across all layers.
@@ -457,9 +538,7 @@ class MoEKVCacheManager:
 
         # Evict if we'd exceed budget
         with self._lock:
-            while (self.total_ram_bytes + new_bytes > self.kv_budget_bytes
-                   and self._evict_one()):
-                pass
+            self._ensure_ram_available(new_bytes)
 
         block = self.layers[layer_idx].append(keys, values)
 
@@ -478,16 +557,53 @@ class MoEKVCacheManager:
         if layer_idx < 0 or layer_idx >= self.n_layers:
             raise IndexError(f"layer_idx {layer_idx} out of range [0, {self.n_layers})")
 
-        k, v = self.layers[layer_idx].get_kv(seq_start, seq_end)
+        layer = self.layers[layer_idx]
+        if seq_end is None:
+            seq_end = layer.seq_len
+        if seq_end <= seq_start:
+            return None, None
 
-        # Track access for blocks in range
-        if k is not None:
-            block_start = (seq_start // self.block_size) * self.block_size
-            while block_start < (seq_end or self.layers[layer_idx].seq_len):
-                self._record_access(layer_idx, block_start)
+        k_parts = []
+        v_parts = []
+
+        block_start = (seq_start // self.block_size) * self.block_size
+        while block_start < seq_end:
+            block = layer.blocks.get(block_start)
+            if block is None:
+                self.cache_misses += 1
                 block_start += self.block_size
+                continue
 
-        return k, v
+            if block.on_disk:
+                self.cache_misses += 1
+                with self._lock:
+                    self._ensure_ram_available(
+                        block.estimated_nbytes,
+                        protected_key=(layer_idx, block_start),
+                    )
+                loaded = block.page_in()
+                if loaded > 0:
+                    self.total_page_ins += 1
+            else:
+                self.cache_hits += 1
+
+            if block.keys is None:
+                block_start += self.block_size
+                continue
+
+            block.touch()
+            local_start = max(0, seq_start - block.seq_start)
+            local_end = min(block.seq_end - block.seq_start, seq_end - block.seq_start)
+            if local_end > local_start:
+                k_parts.append(block.keys[:, local_start:local_end, :])
+                v_parts.append(block.values[:, local_start:local_end, :])
+
+            self._record_access(layer_idx, block_start)
+            block_start += self.block_size
+
+        if not k_parts:
+            return None, None
+        return np.concatenate(k_parts, axis=1), np.concatenate(v_parts, axis=1)
 
     def _record_access(self, layer_idx: int, seq_start: int):
         """Record a block access for eviction scoring."""
@@ -503,17 +619,52 @@ class MoEKVCacheManager:
             self._gap_ema[key] = 0.7 * old_ema + 0.3 * gap
 
         self._last_access_time[key] = now
+        if self._belady_predictor is not None:
+            self._belady_predictor.observe(key)
 
-    def _evict_one(self) -> bool:
+    def plan_future_accesses(self, access_sequence: list[tuple[int, int]]):
+        """Prime the exact Belady predictor with an upcoming access trace."""
+        if self._belady_predictor is None:
+            self._belady_predictor = BeladyPredictor()
+        self._belady_predictor.prime(access_sequence)
+
+    def clear_future_accesses(self):
+        if self._belady_predictor is not None:
+            self._belady_predictor.prime([])
+
+    def _ensure_ram_available(self, extra_bytes: int,
+                              protected_key: Optional[tuple[int, int]] = None):
+        if extra_bytes <= 0:
+            return
+        while self.total_ram_bytes + extra_bytes > self.kv_budget_bytes:
+            if not self._evict_one(protected_key=protected_key):
+                break
+
+    def _spill_path(self, layer_idx: int, seq_start: int) -> str:
+        return os.path.join(self.spill_directory, f"layer{layer_idx}_seq{seq_start}.npz")
+
+    def _evict_one(self, protected_key: Optional[tuple[int, int]] = None) -> bool:
         """Evict one block according to the current eviction policy.
 
         Returns True if a block was evicted, False if nothing evictable.
         """
-        candidate = self._pick_eviction_candidate()
+        candidate = self._pick_eviction_candidate(protected_key=protected_key)
         if candidate is None:
             return False
 
         layer_idx, seq_start = candidate
+        block = self.layers[layer_idx].blocks.get(seq_start)
+        if block is None:
+            return False
+
+        if self.enable_ssd_tiering and self.spill_directory is not None:
+            freed = block.page_out(self._spill_path(layer_idx, seq_start))
+            if freed > 0:
+                self.total_page_outs += 1
+                self.total_evictions += 1
+                self.total_bytes_evicted += freed
+                return True
+
         freed = self.layers[layer_idx].evict_block(seq_start)
         if freed > 0:
             self.total_evictions += 1
@@ -526,12 +677,15 @@ class MoEKVCacheManager:
             return True
         return False
 
-    def _pick_eviction_candidate(self) -> Optional[tuple[int, int]]:
+    def _pick_eviction_candidate(self, protected_key: Optional[tuple[int, int]] = None
+                                 ) -> Optional[tuple[int, int]]:
         """Select the best block to evict based on the eviction policy."""
         candidates = []
         for layer in self.layers:
             for seq_start, block in layer.blocks.items():
                 if block.pinned or block.on_disk:
+                    continue
+                if protected_key is not None and (layer.layer_idx, seq_start) == protected_key:
                     continue
                 candidates.append((layer.layer_idx, seq_start, block))
 
@@ -572,6 +726,13 @@ class MoEKVCacheManager:
         Higher eviction score = evict first (will be needed furthest in future).
         Falls back to frequency-weighted when no predictor is loaded.
         """
+        if self._belady_predictor is not None:
+            best = max(
+                candidates,
+                key=lambda c: self._belady_predictor.next_use_distance((c[0], c[1])),
+            )
+            return (best[0], best[1])
+
         if self._belady_weights is None:
             return self._pick_frequency_weighted(candidates)
 
@@ -612,6 +773,10 @@ class MoEKVCacheManager:
         """Set Belady predictor weights directly (for testing)."""
         self._belady_weights = weights
 
+    def set_belady_predictor(self, predictor: BeladyPredictor):
+        """Set an explicit predictor object (for tests or engine integration)."""
+        self._belady_predictor = predictor
+
     def pin_system_prompt(self, n_tokens: int):
         """Pin the first n_tokens across all layers (system prompt)."""
         for layer in self.layers:
@@ -647,6 +812,10 @@ class MoEKVCacheManager:
         self._gap_ema.clear()
         self._last_access_time.clear()
         self._access_history.clear()
+        if self._owns_spill_directory and self.spill_directory and os.path.isdir(self.spill_directory):
+            shutil.rmtree(self.spill_directory, ignore_errors=True)
+            self.spill_directory = tempfile.mkdtemp(prefix="expertflow-kv-")
+            self._owns_spill_directory = True
 
     def stats(self) -> dict:
         """Global cache statistics."""
@@ -661,6 +830,13 @@ class MoEKVCacheManager:
             "budget_utilization": round(self.budget_utilization, 3),
             "total_evictions": self.total_evictions,
             "total_bytes_evicted": self.total_bytes_evicted,
+            "total_page_outs": self.total_page_outs,
+            "total_page_ins": self.total_page_ins,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": round(self.cache_hit_rate * 100.0, 1),
+            "total_on_disk_blocks": self.total_on_disk_blocks,
+            "ssd_tiering_enabled": self.enable_ssd_tiering,
             "eviction_policy": self.eviction_policy.value,
             "max_tokens_in_budget": self.max_tokens_in_budget(),
         }

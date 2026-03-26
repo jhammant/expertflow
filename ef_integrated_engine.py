@@ -316,6 +316,9 @@ class ModelConfig:
     # Simulated NVMe performance
     cold_load_ms: float = 1.5
     warm_load_ms: float = 0.3
+    kv_block_size: int = 256
+    enable_kv_cache_reads: bool = True
+    enable_kv_ssd_tiering: bool = True
 
     @property
     def n_moe_layers(self) -> int:
@@ -373,6 +376,7 @@ class ExpertFlowEngine:
     def __init__(self, config: ModelConfig = DEEPSEEK_V3_CONFIG,
                  kv_eviction_policy: EvictionPolicy = EvictionPolicy.FREQUENCY_WEIGHTED,
                  initial_kv_fraction: float = 0.15,
+                 kv_spill_directory: str | None = None,
                  zipf_skew: float = 1.1,
                  temporal_locality: float = 0.4,
                  seed: int = 42):
@@ -393,9 +397,11 @@ class ExpertFlowEngine:
             n_layers=config.n_layers,
             num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim,
-            block_size=256,
+            block_size=config.kv_block_size,
             kv_budget_bytes=self.coordinator.kv_budget_bytes,
             eviction_policy=kv_eviction_policy,
+            enable_ssd_tiering=config.enable_kv_ssd_tiering,
+            spill_directory=kv_spill_directory,
         )
 
         # Expert weight store (simulated NVMe)
@@ -431,6 +437,16 @@ class ExpertFlowEngine:
         self.token_times: list[float] = []
         self._rebalance_log: list[dict] = []
 
+    def _plan_kv_access_trace(self) -> list[tuple[int, int]]:
+        """Plan the upcoming KV read order for the next token pass."""
+        if not self.config.enable_kv_cache_reads:
+            return []
+
+        access_trace = []
+        for layer_idx, layer in enumerate(self.kv_cache.layers):
+            access_trace.extend((layer_idx, seq_start) for seq_start in layer.blocks.keys())
+        return access_trace
+
     def _simulate_attention(self, layer_idx: int, n_tokens: int = 1):
         """Simulate attention: generate KV and append to cache.
 
@@ -438,6 +454,10 @@ class ExpertFlowEngine:
         Here we just create random KV tensors of the correct shape.
         """
         t0 = time.monotonic()
+        existing_seq_len = self.kv_cache.layers[layer_idx].seq_len
+        if self.config.enable_kv_cache_reads and existing_seq_len > 0:
+            self.kv_cache.get_kv(layer_idx, 0, existing_seq_len)
+
         keys = np.random.randn(
             self.config.num_kv_heads, n_tokens, self.config.head_dim
         ).astype(np.float16)
@@ -498,6 +518,8 @@ class ExpertFlowEngine:
         token_routing = []
 
         self.expert_cache.reset_token_stats()
+        if self.kv_cache.eviction_policy == EvictionPolicy.BELADY_APPROXIMATE:
+            self.kv_cache.plan_future_accesses(self._plan_kv_access_trace())
 
         for layer_idx in range(self.config.n_layers):
             # Attention (all layers)
@@ -535,6 +557,12 @@ class ExpertFlowEngine:
             "experts_evicted": evicted,
             "kv_ram_mb": round(self.kv_cache.total_ram_bytes / 1024**2, 1),
             "kv_blocks": self.kv_cache.total_blocks,
+            "kv_hits": self.kv_cache.cache_hits,
+            "kv_misses": self.kv_cache.cache_misses,
+            "kv_hit_rate": round(self.kv_cache.cache_hit_rate * 100.0, 1),
+            "kv_page_ins": self.kv_cache.total_page_ins,
+            "kv_page_outs": self.kv_cache.total_page_outs,
+            "kv_on_disk_blocks": self.kv_cache.total_on_disk_blocks,
             "kv_seq_len": self.kv_cache.total_seq_len,
         }
 
@@ -615,6 +643,10 @@ class ExpertFlowEngine:
             "kv_budget_mb": round(self.kv_cache.kv_budget_bytes / 1024**2, 1),
             "kv_seq_len": self.kv_cache.total_seq_len,
             "kv_evictions": self.kv_cache.total_evictions,
+            "kv_hit_rate": round(self.kv_cache.cache_hit_rate * 100.0, 1),
+            "kv_page_ins": self.kv_cache.total_page_ins,
+            "kv_page_outs": self.kv_cache.total_page_outs,
+            "kv_on_disk_blocks": self.kv_cache.total_on_disk_blocks,
             "expert_loads_from_nvme": self.expert_store.total_loads,
             "budget_rebalances": len(self._rebalance_log),
             "token_details": token_stats,

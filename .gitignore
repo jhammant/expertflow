@@ -32,3 +32,4 @@ experiments/*.json
 .vscode/
 *.swp
 *.swo
+.aider*

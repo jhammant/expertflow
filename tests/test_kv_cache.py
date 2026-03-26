@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from ef_kv_manager import (
+    BeladyPredictor,
     KVBlock,
     PagedKVCache,
     MoEKVCacheManager,
@@ -220,6 +221,76 @@ class TestMoEKVCacheManagerBudget:
                 k, v = make_kv(num_kv_heads=2, n_tokens=1, head_dim=16)
                 mgr.append_kv(0, k, v)
             assert mgr.total_evictions > 0, f"Policy {policy.value} did not evict"
+
+    def test_ssd_tiering_pages_out_and_back_in(self, tmp_path):
+        mgr = MoEKVCacheManager(
+            n_layers=1,
+            num_kv_heads=2,
+            head_dim=16,
+            block_size=4,
+            kv_budget_bytes=256,
+            enable_ssd_tiering=True,
+            spill_directory=str(tmp_path),
+        )
+
+        for _ in range(8):
+            k, v = make_kv(num_kv_heads=2, n_tokens=1, head_dim=16)
+            mgr.append_kv(0, k, v)
+
+        assert mgr.total_page_outs > 0
+        assert mgr.total_on_disk_blocks > 0
+
+        keys, values = mgr.get_kv(0, 0, 4)
+        assert keys is not None
+        assert values is not None
+        assert mgr.total_page_ins > 0
+        assert mgr.cache_misses > 0
+
+    def test_get_kv_tracks_hits_and_misses(self, tmp_path):
+        mgr = MoEKVCacheManager(
+            n_layers=1,
+            num_kv_heads=2,
+            head_dim=16,
+            block_size=4,
+            kv_budget_bytes=1024,
+            enable_ssd_tiering=True,
+            spill_directory=str(tmp_path),
+        )
+
+        for _ in range(4):
+            k, v = make_kv(num_kv_heads=2, n_tokens=1, head_dim=16)
+            mgr.append_kv(0, k, v)
+
+        mgr.get_kv(0, 0, 4)
+        assert mgr.cache_hits > 0
+
+        block = mgr.layers[0].blocks[0]
+        block.page_out(str(tmp_path / "manual_block.npz"))
+        mgr.get_kv(0, 0, 4)
+        assert mgr.cache_misses > 0
+        assert mgr.total_page_ins > 0
+
+    def test_belady_predictor_evicts_farthest_future_use(self):
+        mgr = MoEKVCacheManager(
+            n_layers=1,
+            num_kv_heads=2,
+            head_dim=16,
+            block_size=4,
+            kv_budget_bytes=256,
+            eviction_policy=EvictionPolicy.BELADY_APPROXIMATE,
+            enable_ssd_tiering=False,
+        )
+
+        for _ in range(12):
+            k, v = make_kv(num_kv_heads=2, n_tokens=1, head_dim=16)
+            mgr.append_kv(0, k, v)
+
+        predictor = BeladyPredictor()
+        predictor.prime([(0, 0), (0, 4)])
+        mgr.set_belady_predictor(predictor)
+
+        victim = mgr._pick_eviction_candidate()
+        assert victim == (0, 8)
 
 
 class TestKVExpertBudgetCoordinator:

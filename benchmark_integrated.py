@@ -191,6 +191,9 @@ def run_benchmark(config: ModelConfig, n_turns: int = 5,
         result["avg_expert_hit_rate"] = round(float(avg_hit), 1)
         result["warmup_hit_rate"] = round(float(warmup_hit), 1)
         result["steady_state_hit_rate"] = round(float(steady_hit), 1)
+        result["kv_cache_hit_rate"] = round(engine.kv_cache.cache_hit_rate * 100.0, 1)
+        result["kv_cache_hits"] = engine.kv_cache.cache_hits
+        result["kv_cache_misses"] = engine.kv_cache.cache_misses
 
         turn_results.append(result)
 
@@ -204,7 +207,11 @@ def run_benchmark(config: ModelConfig, n_turns: int = 5,
             print(f"    Expert cache:  {result['expert_cache_size']}/{result['expert_cache_budget']} slots")
             print(f"    KV cache:      {result['kv_ram_mb']:.1f} MB "
                   f"(seq_len={result['kv_seq_len']}, "
-                  f"evictions={result['kv_evictions']})")
+                  f"evictions={result['kv_evictions']}, "
+                  f"hit={result['kv_cache_hit_rate']:.1f}%)")
+            print(f"    KV tiering:    page-ins={result['kv_page_ins']} "
+                  f"page-outs={result['kv_page_outs']} "
+                  f"on-disk={result['kv_on_disk_blocks']}")
             print(f"    KV budget:     {result['kv_budget_mb']:.1f} MB")
             print(f"    NVMe loads:    {result['expert_loads_from_nvme']}")
             print(f"    Rebalances:    {result['budget_rebalances']}")
@@ -227,7 +234,13 @@ def run_benchmark(config: ModelConfig, n_turns: int = 5,
         "final_expert_hit_rate": round(engine.expert_cache.total_hit_rate, 1),
         "final_expert_cache_size": engine.expert_cache.size,
         "final_kv_ram_mb": round(engine.kv_cache.total_ram_bytes / 1024**2, 1),
+        "final_kv_hit_rate": round(engine.kv_cache.cache_hit_rate * 100.0, 1),
+        "total_kv_hits": engine.kv_cache.cache_hits,
+        "total_kv_misses": engine.kv_cache.cache_misses,
         "total_kv_evictions": engine.kv_cache.total_evictions,
+        "total_kv_page_ins": engine.kv_cache.total_page_ins,
+        "total_kv_page_outs": engine.kv_cache.total_page_outs,
+        "final_kv_on_disk_blocks": engine.kv_cache.total_on_disk_blocks,
         "total_expert_nvme_loads": engine.expert_store.total_loads,
         "total_nvme_mb_read": round(engine.expert_store.total_bytes_loaded / 1024**2, 1),
         "total_rebalances": len(engine._rebalance_log),
@@ -272,6 +285,11 @@ def run_benchmark(config: ModelConfig, n_turns: int = 5,
         print(f"  Expert cache:    {aggregate['final_expert_cache_size']} slots")
         print(f"  KV RAM:          {aggregate['final_kv_ram_mb']} MB "
               f"(evictions: {aggregate['total_kv_evictions']})")
+        print(f"  KV hit rate:     {aggregate['final_kv_hit_rate']}% "
+              f"({aggregate['total_kv_hits']} hits / {aggregate['total_kv_misses']} misses)")
+        print(f"  KV tiering:      {aggregate['total_kv_page_ins']} page-ins / "
+              f"{aggregate['total_kv_page_outs']} page-outs "
+              f"({aggregate['final_kv_on_disk_blocks']} on disk)")
         print(f"  NVMe loads:      {aggregate['total_expert_nvme_loads']} "
               f"({aggregate['total_nvme_mb_read']} MB)")
         print(f"  Budget split:    KV {aggregate['final_kv_fraction']*100:.1f}% / "
@@ -302,18 +320,23 @@ def run_eviction_policy_comparison(config: ModelConfig, n_turns: int = 3,
         comparison[policy.value] = {
             "avg_decode_tok_s": result["aggregate"]["avg_decode_tok_s"],
             "avg_expert_hit_rate": result["aggregate"]["avg_expert_hit_rate"],
+            "final_kv_hit_rate": result["aggregate"]["final_kv_hit_rate"],
             "total_kv_evictions": result["aggregate"]["total_kv_evictions"],
+            "total_kv_page_outs": result["aggregate"]["total_kv_page_outs"],
+            "total_kv_page_ins": result["aggregate"]["total_kv_page_ins"],
             "total_expert_nvme_loads": result["aggregate"]["total_expert_nvme_loads"],
         }
 
     if verbose:
         print("\n  " + "-" * 60)
-        print(f"  {'Policy':<25} {'Hit Rate':>10} {'tok/s':>8} {'KV Evict':>10} {'NVMe Loads':>12}")
+        print(f"  {'Policy':<25} {'Hit Rate':>10} {'KV Hit':>8} {'tok/s':>8} {'KV Evict':>10} {'KV IO':>10} {'NVMe Loads':>12}")
         print("  " + "-" * 60)
         for policy, stats in comparison.items():
             print(f"  {policy:<25} {stats['avg_expert_hit_rate']:>9.1f}% "
+                  f"{stats['final_kv_hit_rate']:>7.1f}% "
                   f"{stats['avg_decode_tok_s']:>7.1f} "
                   f"{stats['total_kv_evictions']:>10} "
+                  f"{stats['total_kv_page_ins'] + stats['total_kv_page_outs']:>10} "
                   f"{stats['total_expert_nvme_loads']:>12}")
 
     return comparison
