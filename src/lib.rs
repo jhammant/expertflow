@@ -18,6 +18,10 @@ pub mod bridge;
 
 pub use cache::disk::{DiskCache, CacheEntry};
 
+pub use cache::{
+    expert_loader::{ExpertMmapLoader, ExpertPrefetchLoader, CachedExpert, LoaderStats},
+};
+
 pub use core::{
     scheduler::ExpertScheduler,
     prefetcher::AsyncPrefetcher,
@@ -36,7 +40,7 @@ pub use model::{
 
 pub use profiler::{
     heatmap::ExpertHeatmap,
-    bench::BenchmarkSuite,
+    bench::{ExpertBenchmarkSuite, ExpertBenchmarkResult, BenchmarkSummary},
 };
 
 pub use quant::adaptive::{AdaptiveQuantizer, QuantLevel};
